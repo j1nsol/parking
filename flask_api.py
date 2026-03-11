@@ -73,6 +73,7 @@ _smoothing_hist  = {}            # slot_id -> deque for temporal smoothing
 _mapping_phase   = True          # True while auto-mapper is still running
 _frame_count     = 0
 _last_fb_push    = 0             # epoch ms of last Firebase push
+_remap_requested = False         # Set by /remap route, consumed by bg thread
 
 # ── Shared undistort state — hot-reloaded from Firebase ──────────────────────
 _undistort_cfg = {
@@ -192,7 +193,7 @@ def _detection_loop():
     Owns: camera, YOLO inference, auto-mapper, Firebase sync, smoothing.
     Writes results into shared state for Flask routes to read.
     """
-    global _latest_frame, _latest_raw_frame, _latest_statuses, _slots, _mapping_phase, _frame_count, _last_fb_push, firebase_instance
+    global _latest_frame, _latest_raw_frame, _latest_statuses, _slots, _mapping_phase, _frame_count, _last_fb_push, firebase_instance, _remap_requested
 
     # ── Firebase ──────────────────────────────────────────────────────────────
     firebase = None
@@ -261,6 +262,23 @@ def _detection_loop():
                 log.warning("[BG] No frame — retrying in 1s")
                 time.sleep(1)
                 continue
+
+            # ── Check if admin triggered a remap ─────────────────────────────
+            with _state_lock:
+                do_remap = _remap_requested
+                if do_remap:
+                    _remap_requested = False
+
+            if do_remap:
+                log.info("[BG] Remap request received — resetting mapper and frame count.")
+                mapper._detections   = []
+                mapper._frame_count  = 0
+                mapper._slots        = {}
+                local_frame_count    = 0
+                sample_saved         = False
+                with _state_lock:
+                    _mapping_phase = True
+                log.info("[BG] Mapper reset. Starting fresh mapping phase (~150 frames)...")
 
             # ── Poll Firebase for undistort config changes every 5s ───────────
             now = time.time()
@@ -546,9 +564,9 @@ def set_undistort_config():
     fov_degrees = float(data.get("fov_degrees", _undistort_cfg["fov_degrees"]))
     zoom        = float(data.get("zoom",        _undistort_cfg["zoom"]))
 
-    # Clamp to safe ranges
-    fov_degrees = max(100.0, min(250.0, fov_degrees))
-    zoom        = max(0.3,   min(1.0,   zoom))
+    # Clamp to safe ranges — beyond these OpenCV fisheye math produces black frames
+    fov_degrees = max(150.0, min(195.0, fov_degrees))
+    zoom        = max(0.4,   min(0.85,  zoom))
 
     # Write to Firebase — bg thread will hot-reload within 5s
     if firebase_instance:
@@ -628,17 +646,17 @@ def undistort_preview():
 @app.route("/remap", methods=["POST"])
 def trigger_remap():
     """
-    Admin endpoint — forces a fresh auto-mapping run by clearing slot config
-    and resetting mapping phase. Next 150 frames will re-discover slot layout.
+    Admin endpoint — signals the bg thread to reset the AutoMapper object
+    and restart the mapping phase. Uses a flag so the bg thread handles
+    the reset itself, avoiding race conditions with the mapper object.
     """
-    global _slots, _mapping_phase, _smoothing_hist
+    global _remap_requested
     with _state_lock:
-        _slots         = {}
-        _mapping_phase = True
-        _smoothing_hist = {}
+        _remap_requested = True
+        _smoothing_hist  = {}
     if os.path.exists(SLOT_CONFIG):
         os.remove(SLOT_CONFIG)
-    log.info("[ADMIN] Remap triggered — slot config cleared.")
+    log.info("[ADMIN] Remap requested — bg thread will reset mapper on next frame.")
     return jsonify({"status": "remap_started", "message": "Auto-mapping restarted. ~150 frames needed."})
 
 
