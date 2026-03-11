@@ -44,12 +44,16 @@ TARGET_CLASSES = [2, 5, 7]   # COCO: car, bus, truck
 IOU_THRESHOLD  = 0.35
 SMOOTHING_WIN  = 5            # frames for majority-vote smoothing
 DETECT_INTERVAL = 1.0         # seconds between detection cycles
-FIREBASE_EVERY  = 3           # push Firebase every N detection cycles
+FIREBASE_EVERY  = 2           # push Firebase every N detection cycles
 
-# Fisheye undistortion — set UNDISTORT=True if your camera needs it
+# Fisheye undistortion — values are live-fetched from Firebase every 5s.
+# These are only the startup fallback defaults used before Firebase responds.
 UNDISTORT   = False
 FOV_DEGREES = 185.0
 ZOOM        = 0.7
+
+# How often the bg thread checks Firebase for undistort config changes (seconds)
+UNDISTORT_POLL_INTERVAL = 5
 
 os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
 
@@ -68,6 +72,13 @@ _smoothing_hist  = {}            # slot_id -> deque for temporal smoothing
 _mapping_phase   = True          # True while auto-mapper is still running
 _frame_count     = 0
 _last_fb_push    = 0             # epoch ms of last Firebase push
+
+# ── Shared undistort state — hot-reloaded from Firebase ──────────────────────
+_undistort_cfg = {
+    "enabled":     UNDISTORT,
+    "fov_degrees": FOV_DEGREES,
+    "zoom":        ZOOM,
+}
 
 # ── Load existing slot config if present ─────────────────────────────────────
 if os.path.exists(SLOT_CONFIG):
@@ -170,13 +181,17 @@ def _get_raw_frame():
 
 # ── Background detection + sync thread ───────────────────────────────────────
 
+# Module-level firebase reference so API routes can call push_undistort_config
+firebase_instance = None
+
+
 def _detection_loop():
     """
     Runs forever as a daemon thread.
     Owns: camera, YOLO inference, auto-mapper, Firebase sync, smoothing.
     Writes results into shared state for Flask routes to read.
     """
-    global _latest_frame, _latest_statuses, _slots, _mapping_phase, _frame_count, _last_fb_push
+    global _latest_frame, _latest_statuses, _slots, _mapping_phase, _frame_count, _last_fb_push, firebase_instance
 
     # ── Firebase ──────────────────────────────────────────────────────────────
     firebase = None
@@ -185,6 +200,7 @@ def _detection_loop():
             credentials_path=CREDENTIALS,
             database_url=FIREBASE_URL,
         )
+        firebase_instance = firebase
     except Exception as e:
         log.error(f"[FB] Firebase init failed — occupancy won't be synced: {e}")
 
@@ -202,15 +218,35 @@ def _detection_loop():
     else:
         log.info("[BG] No slot map found — starting auto-mapping phase (~150 frames)...")
 
-    # ── Undistorter (optional) ────────────────────────────────────────────────
-    undistorter = None
-    if UNDISTORT:
+    # ── Undistorter — built from Firebase config, hot-reloaded on change ────
+    undistorter      = None
+    last_cfg_check   = 0
+    active_cfg       = {"enabled": False, "fov_degrees": 185.0, "zoom": 0.7}
+
+    def _rebuild_undistorter(cfg: dict):
+        """Instantiate a new FisheyeUndistorter from cfg, or None if disabled."""
+        if not cfg.get("enabled", False):
+            log.info("[BG] Undistortion disabled.")
+            return None
         try:
             from undistort import FisheyeUndistorter
-            undistorter = FisheyeUndistorter(fov_degrees=FOV_DEGREES, zoom=ZOOM)
-            log.info("[BG] Fisheye undistortion enabled.")
+            u = FisheyeUndistorter(fov_degrees=cfg["fov_degrees"], zoom=cfg["zoom"])
+            log.info(f"[BG] Undistorter built — FOV={cfg['fov_degrees']}° zoom={cfg['zoom']}")
+            return u
         except ImportError:
             log.warning("[BG] undistort.py not found — running without undistortion.")
+            return None
+
+    # Fetch initial config from Firebase
+    if firebase:
+        try:
+            initial_cfg = firebase.get_undistort_config()
+            with _state_lock:
+                _undistort_cfg.update(initial_cfg)
+            active_cfg  = dict(initial_cfg)
+            undistorter = _rebuild_undistorter(active_cfg)
+        except Exception as e:
+            log.warning(f"[BG] Could not fetch initial undistort config: {e}")
 
     sample_saved = False
     local_frame_count = 0
@@ -224,6 +260,21 @@ def _detection_loop():
                 log.warning("[BG] No frame — retrying in 1s")
                 time.sleep(1)
                 continue
+
+            # ── Poll Firebase for undistort config changes every 5s ───────────
+            now = time.time()
+            if firebase and (now - last_cfg_check) >= UNDISTORT_POLL_INTERVAL:
+                last_cfg_check = now
+                try:
+                    new_cfg = firebase.get_undistort_config()
+                    if new_cfg != active_cfg:
+                        log.info(f"[BG] Undistort config changed: {new_cfg}")
+                        active_cfg  = new_cfg
+                        undistorter = _rebuild_undistorter(active_cfg)
+                        with _state_lock:
+                            _undistort_cfg.update(active_cfg)
+                except Exception as e:
+                    log.warning(f"[BG] Undistort config poll failed: {e}")
 
             # Save undistort preview once on startup
             if not sample_saved and undistorter:
@@ -468,6 +519,96 @@ def analyze_image():
         "occupancy_percent": round((occupied_count / max(1, len(current_slots))) * 100),
         "timestamp": int(time.time() * 1000),
     })
+
+
+@app.route("/undistort-config", methods=["GET"])
+def get_undistort_config():
+    """Returns the current undistort config from shared state."""
+    with _state_lock:
+        cfg = dict(_undistort_cfg)
+    return jsonify(cfg)
+
+
+@app.route("/undistort-config", methods=["POST"])
+def set_undistort_config():
+    """
+    Admin endpoint — write new undistort config to Firebase.
+    The background thread will pick it up within UNDISTORT_POLL_INTERVAL seconds.
+    Body: { "enabled": bool, "fov_degrees": float, "zoom": float }
+    """
+    data = request.get_json(silent=True) or {}
+    enabled     = bool(data.get("enabled",     _undistort_cfg["enabled"]))
+    fov_degrees = float(data.get("fov_degrees", _undistort_cfg["fov_degrees"]))
+    zoom        = float(data.get("zoom",        _undistort_cfg["zoom"]))
+
+    # Clamp to safe ranges
+    fov_degrees = max(100.0, min(250.0, fov_degrees))
+    zoom        = max(0.3,   min(1.0,   zoom))
+
+    # Write to Firebase — bg thread will hot-reload within 5s
+    if firebase_instance:
+        firebase_instance.push_undistort_config(enabled, fov_degrees, zoom)
+
+    # Optimistically update shared state so GET reflects it immediately
+    with _state_lock:
+        _undistort_cfg["enabled"]     = enabled
+        _undistort_cfg["fov_degrees"] = fov_degrees
+        _undistort_cfg["zoom"]        = zoom
+
+    log.info(f"[API] Undistort config updated: enabled={enabled} fov={fov_degrees} zoom={zoom}")
+    return jsonify({
+        "status": "ok",
+        "config": {"enabled": enabled, "fov_degrees": fov_degrees, "zoom": zoom},
+        "message": "Config saved. Pi will apply within 5 seconds.",
+    })
+
+
+@app.route("/undistort-preview", methods=["GET"])
+def undistort_preview():
+    """
+    Grabs one fresh frame, applies current undistort settings,
+    and returns a side-by-side before/after JPEG.
+    Called manually from the admin panel — not polled.
+    """
+    frame = _get_raw_frame()
+    if frame is None:
+        placeholder = np.zeros((400, 1280, 3), dtype=np.uint8)
+        cv2.putText(placeholder, "Camera unavailable", (400, 200),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.2, (80, 80, 80), 2)
+        _, buf = cv2.imencode(".jpg", placeholder)
+        return Response(buf.tobytes(), mimetype="image/jpeg")
+
+    with _state_lock:
+        cfg = dict(_undistort_cfg)
+
+    if cfg.get("enabled", False):
+        try:
+            from undistort import FisheyeUndistorter
+            u = FisheyeUndistorter(fov_degrees=cfg["fov_degrees"], zoom=cfg["zoom"])
+            corrected = u.process(frame.copy())
+        except Exception as e:
+            log.warning(f"[PREVIEW] Undistort failed: {e}")
+            corrected = frame.copy()
+    else:
+        corrected = frame.copy()
+
+    # Label each side
+    orig = frame.copy()
+    h, w = orig.shape[:2]
+    for img, label in [(orig, "ORIGINAL"), (corrected, f"UNDISTORTED  FOV={cfg['fov_degrees']}  zoom={cfg['zoom']}")]:
+        cv2.rectangle(img, (0, 0), (w, 38), (7, 10, 16), -1)
+        cv2.putText(img, label, (12, 26),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.75,
+                    (80, 80, 80) if not cfg.get("enabled") else (80, 200, 120), 2)
+
+    side_by_side = np.hstack([orig, corrected])
+    out = cv2.resize(side_by_side, (1280, 360))
+    _, buf = cv2.imencode(".jpg", out, [cv2.IMWRITE_JPEG_QUALITY, 80])
+    return Response(
+        buf.tobytes(),
+        mimetype="image/jpeg",
+        headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+    )
 
 
 @app.route("/remap", methods=["POST"])
