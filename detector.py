@@ -7,6 +7,7 @@ import numpy as np
 from collections import deque
 from ultralytics import YOLO
 import logging
+import os
 
 log = logging.getLogger(__name__)
 
@@ -16,9 +17,9 @@ RTSP_URL = "rtsp://admin:Skibidi1@192.168.1.142:554/Streaming/Channels/101"
 class ParkingDetector:
     def __init__(
         self,
-        model_path: str = "yolov5n.pt",
+        model_path: str = "yolov5nu.pt",
         rtsp_url: str = RTSP_URL,
-        confidence: float = 0.45,
+        confidence: float = 0.20,
         target_classes: list = None,
         smoothing_window: int = 5,
     ):
@@ -59,6 +60,7 @@ class ParkingDetector:
         if not ret:
             log.warning("RTSP stream lost — reconnecting...")
             self.cap.release()
+            os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
             self.cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_FFMPEG)
             self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
             ret, frame = self.cap.read()

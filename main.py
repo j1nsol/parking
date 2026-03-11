@@ -28,7 +28,7 @@ def main():
     # 2. Initialize auto-mapper (discovers slot layout from video)
     mapper = AutoMapper(
         slot_config_path="slot_config.json",
-        min_frames_to_map=300     # ~5 minutes at 1 FPS
+        min_frames_to_map=150     # ~5 minutes at 1 FPS
     )
 
     # 3. Initialize YOLO detector

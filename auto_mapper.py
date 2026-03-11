@@ -23,7 +23,7 @@ class AutoMapper:
         slot_config_path: str = "slot_config.json",
         min_frames_to_map: int = 300,
         eps_pixels: int = 40,
-        min_samples: int = 10,
+        min_samples: int = 3,
     ):
         """
         Args:
