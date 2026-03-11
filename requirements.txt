@@ -1,0 +1,8 @@
+# AI Smart Parking System — Raspberry Pi dependencies
+# Install with: pip install -r requirements.txt --break-system-packages
+
+ultralytics>=8.0.0        # YOLO (includes PyTorch)
+opencv-python>=4.8.0      # Camera capture + image processing
+firebase-admin>=6.2.0     # Firebase Realtime Database
+scikit-learn>=1.3.0       # DBSCAN for auto-mapping
+numpy>=1.24.0
