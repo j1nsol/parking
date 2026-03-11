@@ -77,9 +77,10 @@ _remap_requested = False         # Set by /remap route, consumed by bg thread
 
 # ── Shared undistort state — hot-reloaded from Firebase ──────────────────────
 _undistort_cfg = {
-    "enabled":     UNDISTORT,
-    "fov_degrees": FOV_DEGREES,
-    "zoom":        ZOOM,
+    "enabled": False,
+    "k1":      -0.3,
+    "k2":      0.1,
+    "alpha":   0.0,
 }
 
 # ── Load existing slot config if present ─────────────────────────────────────
@@ -226,14 +227,18 @@ def _detection_loop():
     active_cfg       = {"enabled": False, "fov_degrees": 185.0, "zoom": 0.7}
 
     def _rebuild_undistorter(cfg: dict):
-        """Instantiate a new FisheyeUndistorter from cfg, or None if disabled."""
+        """Instantiate a new WideAngleUndistorter from cfg, or None if disabled."""
         if not cfg.get("enabled", False):
             log.info("[BG] Undistortion disabled.")
             return None
         try:
-            from undistort import FisheyeUndistorter
-            u = FisheyeUndistorter(fov_degrees=cfg["fov_degrees"], zoom=cfg["zoom"])
-            log.info(f"[BG] Undistorter built — FOV={cfg['fov_degrees']}° zoom={cfg['zoom']}")
+            from undistort import WideAngleUndistorter
+            u = WideAngleUndistorter(
+                k1=cfg["k1"], k2=cfg["k2"],
+                p1=0.0, p2=0.0,
+                alpha=cfg["alpha"],
+            )
+            log.info(f"[BG] Undistorter built — k1={cfg['k1']} k2={cfg['k2']} alpha={cfg['alpha']}")
             return u
         except ImportError:
             log.warning("[BG] undistort.py not found — running without undistortion.")
@@ -560,28 +565,29 @@ def set_undistort_config():
     Body: { "enabled": bool, "fov_degrees": float, "zoom": float }
     """
     data = request.get_json(silent=True) or {}
-    enabled     = bool(data.get("enabled",     _undistort_cfg["enabled"]))
-    fov_degrees = float(data.get("fov_degrees", _undistort_cfg["fov_degrees"]))
-    zoom        = float(data.get("zoom",        _undistort_cfg["zoom"]))
+    enabled = bool(data.get("enabled", _undistort_cfg["enabled"]))
+    k1      = float(data.get("k1",      _undistort_cfg["k1"]))
+    k2      = float(data.get("k2",      _undistort_cfg["k2"]))
+    alpha   = float(data.get("alpha",   _undistort_cfg["alpha"]))
 
-    # Clamp to safe ranges — beyond these OpenCV fisheye math produces black frames
-    fov_degrees = max(150.0, min(195.0, fov_degrees))
-    zoom        = max(0.4,   min(0.85,  zoom))
+    # Clamp to safe ranges
+    k1    = max(-0.8, min(0.0,  k1))
+    k2    = max( 0.0, min(0.3,  k2))
+    alpha = max( 0.0, min(1.0,  alpha))
 
-    # Write to Firebase — bg thread will hot-reload within 5s
     if firebase_instance:
-        firebase_instance.push_undistort_config(enabled, fov_degrees, zoom)
+        firebase_instance.push_undistort_config(enabled, k1, k2, alpha)
 
-    # Optimistically update shared state so GET reflects it immediately
     with _state_lock:
-        _undistort_cfg["enabled"]     = enabled
-        _undistort_cfg["fov_degrees"] = fov_degrees
-        _undistort_cfg["zoom"]        = zoom
+        _undistort_cfg["enabled"] = enabled
+        _undistort_cfg["k1"]      = k1
+        _undistort_cfg["k2"]      = k2
+        _undistort_cfg["alpha"]   = alpha
 
-    log.info(f"[API] Undistort config updated: enabled={enabled} fov={fov_degrees} zoom={zoom}")
+    log.info(f"[API] Undistort config updated: enabled={enabled} k1={k1} k2={k2} alpha={alpha}")
     return jsonify({
         "status": "ok",
-        "config": {"enabled": enabled, "fov_degrees": fov_degrees, "zoom": zoom},
+        "config": {"enabled": enabled, "k1": k1, "k2": k2, "alpha": alpha},
         "message": "Config saved. Pi will apply within 5 seconds.",
     })
 
@@ -609,8 +615,12 @@ def undistort_preview():
     # Always apply undistortion for the preview so you can compare
     # regardless of whether the toggle is currently enabled
     try:
-        from undistort import FisheyeUndistorter
-        u = FisheyeUndistorter(fov_degrees=cfg["fov_degrees"], zoom=cfg["zoom"])
+        from undistort import WideAngleUndistorter
+        u = WideAngleUndistorter(
+            k1=cfg["k1"], k2=cfg["k2"],
+            p1=0.0, p2=0.0,
+            alpha=cfg["alpha"],
+        )
         corrected = u.process(raw.copy())
     except Exception as e:
         log.warning(f"[PREVIEW] Undistort failed: {e}")
@@ -623,7 +633,7 @@ def undistort_preview():
     enabled_str = "ENABLED" if cfg.get("enabled") else "DISABLED (preview only)"
     for img, label, color in [
         (orig,      "ORIGINAL",  (100, 100, 100)),
-        (corrected, f"UNDISTORTED  FOV={cfg['fov_degrees']}°  zoom={cfg['zoom']}  [{enabled_str}]",
+        (corrected, f"CORRECTED  k1={cfg['k1']}  k2={cfg['k2']}  alpha={cfg['alpha']}  [{enabled_str}]",
                                  (80, 200, 120) if cfg.get("enabled") else (56, 189, 248)),
     ]:
         cv2.rectangle(img, (0, 0), (w, 42), (7, 10, 16), -1)

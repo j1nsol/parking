@@ -11,9 +11,10 @@ log = logging.getLogger(__name__)
 
 # Default undistort config — written to Firebase on first run if not present
 DEFAULT_UNDISTORT_CONFIG = {
-    "enabled":     False,
-    "fov_degrees": 185.0,
-    "zoom":        0.7,
+    "enabled": False,
+    "k1":      -0.3,
+    "k2":      0.1,
+    "alpha":   0.0,
 }
 
 
@@ -108,23 +109,22 @@ class FirebaseSync:
                 log.info("[FB] Undistort config initialised with defaults.")
                 return dict(DEFAULT_UNDISTORT_CONFIG)
             return {
-                "enabled":     bool(val.get("enabled",     DEFAULT_UNDISTORT_CONFIG["enabled"])),
-                "fov_degrees": float(val.get("fov_degrees", DEFAULT_UNDISTORT_CONFIG["fov_degrees"])),
-                "zoom":        float(val.get("zoom",        DEFAULT_UNDISTORT_CONFIG["zoom"])),
+                "enabled": bool(val.get("enabled", DEFAULT_UNDISTORT_CONFIG["enabled"])),
+                "k1":      float(val.get("k1",      DEFAULT_UNDISTORT_CONFIG["k1"])),
+                "k2":      float(val.get("k2",      DEFAULT_UNDISTORT_CONFIG["k2"])),
+                "alpha":   float(val.get("alpha",   DEFAULT_UNDISTORT_CONFIG["alpha"])),
             }
         except Exception as e:
             log.warning(f"Failed to read undistort config — using defaults: {e}")
             return dict(DEFAULT_UNDISTORT_CONFIG)
 
-    def push_undistort_config(self, enabled: bool, fov_degrees: float, zoom: float):
-        """
-        Write undistort config to Firebase.
-        Called by the web admin panel when the user applies new settings.
-        """
+    def push_undistort_config(self, enabled: bool, k1: float, k2: float, alpha: float):
+        """Write undistort config to Firebase."""
         payload = {
-            "enabled":     enabled,
-            "fov_degrees": round(float(fov_degrees), 1),
-            "zoom":        round(float(zoom), 2),
+            "enabled": enabled,
+            "k1":      round(float(k1),    2),
+            "k2":      round(float(k2),    3),
+            "alpha":   round(float(alpha), 1),
         }
         try:
             db.reference("/undistort_config").set(payload)
