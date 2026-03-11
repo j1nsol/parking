@@ -50,7 +50,8 @@ class ParkingDetector:
     # ------------------------------------------------------------------
     # Frame capture
     # ------------------------------------------------------------------
-    def capture_frame(self):
+    def capture_frame(self) -> np.ndarray | None:
+    """Capture one frame from the camera."""
     ret, frame = self.cap.read()
     if not ret:
         log.warning("RTSP stream lost — reconnecting...")
