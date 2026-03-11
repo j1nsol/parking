@@ -10,9 +10,10 @@ import logging
 
 log = logging.getLogger(__name__)
 
+RTSP_URL = "rtsp://admin:Skibidi1@192.168.1.142:554/Streaming/Channels/101"
+
 
 class ParkingDetector:
-    RTSP_URL = "rtsp://admin:Skibidi1@192.168.1.142:554/Streaming/Channels/101"
     def __init__(
         self,
         model_path: str = "yolov5n.pt",
@@ -24,7 +25,7 @@ class ParkingDetector:
         """
         Args:
             model_path: YOLO model file (.pt). Downloads automatically if not found.
-            camera_index: OpenCV camera index (0 = first USB cam).
+            rtsp_url: RTSP stream URL for the IP camera.
             confidence: Minimum detection confidence threshold.
             target_classes: COCO class IDs to detect (2=car, 5=bus, 7=truck).
             smoothing_window: Frames to average for temporal smoothing.
@@ -32,17 +33,19 @@ class ParkingDetector:
         self.conf = confidence
         self.target_classes = target_classes or [2, 5, 7]
         self.smoothing_window = smoothing_window
+        self.rtsp_url = rtsp_url
 
         # Load YOLO model
         log.info(f"Loading YOLO model: {model_path}")
         self.model = YOLO(model_path)
 
-        # Open camera
+        # Open RTSP stream
+        log.info(f"Connecting to RTSP stream: {rtsp_url}")
         self.cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         if not self.cap.isOpened():
-            raise RuntimeError(f"Cannot open camera index {rtsp_url}")
-        log.info("Camera opened successfully.")
+            raise RuntimeError(f"Cannot open RTSP stream: {rtsp_url}")
+        log.info("RTSP stream opened successfully.")
 
         # Smoothing history: slot_id -> deque of recent statuses
         self._history: dict[str, deque] = {}
@@ -51,15 +54,15 @@ class ParkingDetector:
     # Frame capture
     # ------------------------------------------------------------------
     def capture_frame(self) -> np.ndarray | None:
-    """Capture one frame from the camera."""
-    ret, frame = self.cap.read()
-    if not ret:
-        log.warning("RTSP stream lost — reconnecting...")
-        self.cap.release()
-        self.cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_FFMPEG)
-        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        """Capture one frame from the RTSP stream, reconnecting if dropped."""
         ret, frame = self.cap.read()
-    return frame if ret else None
+        if not ret:
+            log.warning("RTSP stream lost — reconnecting...")
+            self.cap.release()
+            self.cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_FFMPEG)
+            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            ret, frame = self.cap.read()
+        return frame if ret else None
 
     # ------------------------------------------------------------------
     # Vehicle detection
@@ -141,5 +144,6 @@ class ParkingDetector:
     # Cleanup
     # ------------------------------------------------------------------
     def release(self):
+        """Release the RTSP stream."""
         self.cap.release()
-        log.info("Camera released.")
+        log.info("RTSP stream released.")
