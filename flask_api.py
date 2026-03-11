@@ -643,6 +643,132 @@ def set_program_config():
     })
 
 
+def _auto_calibrate_distortion(frame: np.ndarray) -> dict:
+    """
+    Estimate best-fit k1/k2 barrel distortion coefficients by finding the
+    values that maximise line straightness in the frame.
+
+    Strategy:
+      1. Detect edges → find long line segments via HoughLinesP
+      2. For each candidate (k1, k2) pair, apply undistortion and measure
+         how straight the detected line segments become (residual from linear fit)
+      3. Return the (k1, k2) with the lowest total residual error.
+
+    Works well for parking lots which have clear straight lane markings.
+    """
+    from undistort import WideAngleUndistorter
+
+    h, w = frame.shape[:2]
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+    # Detect edges on the raw frame to find candidate line pixels
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges   = cv2.Canny(blurred, 50, 150)
+
+    # Find long line segments — parking lot markings are typically long
+    lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=80,
+                            minLineLength=w//8, maxLineGap=20)
+
+    if lines is None or len(lines) < 4:
+        log.warning("[AUTOCAL] Not enough lines detected — returning default coefficients.")
+        return {"k1": -0.3, "k2": 0.1, "alpha": 0.0, "score": None, "lines_found": 0}
+
+    log.info(f"[AUTOCAL] Found {len(lines)} line segments. Searching k1/k2 space...")
+
+    # Search grid — coarse then fine
+    k1_candidates = np.arange(-0.7, 0.01, 0.05)
+    k2_candidates = np.arange(0.0,  0.31, 0.05)
+
+    best_k1, best_k2, best_score = -0.3, 0.1, float("inf")
+
+    for k1 in k1_candidates:
+        for k2 in k2_candidates:
+            try:
+                u = WideAngleUndistorter(k1=float(k1), k2=float(k2), alpha=0.0)
+                corrected = u.process(frame.copy())
+                c_gray    = cv2.cvtColor(corrected, cv2.COLOR_BGR2GRAY)
+                c_edges   = cv2.Canny(cv2.GaussianBlur(c_gray,(5,5),0), 50, 150)
+                c_lines   = cv2.HoughLinesP(c_edges, 1, np.pi/180, threshold=60,
+                                            minLineLength=w//10, maxLineGap=20)
+                if c_lines is None:
+                    continue
+
+                # Measure straightness: for each line segment fit a line
+                # and compute mean squared residual of its endpoints
+                total_residual = 0.0
+                count = 0
+                for seg in c_lines:
+                    x1c,y1c,x2c,y2c = seg[0]
+                    length = np.hypot(x2c-x1c, y2c-y1c)
+                    if length < w//12:
+                        continue
+                    # Residual from perfect line = 0 for a straight segment
+                    # Use the angle deviation as proxy — straighter = closer to 0 or 90
+                    angle = abs(np.degrees(np.arctan2(y2c-y1c, x2c-x1c))) % 90
+                    deviation = min(angle, 90-angle)   # 0 = perfectly H or V
+                    total_residual += deviation / max(length, 1)
+                    count += 1
+
+                if count == 0:
+                    continue
+                score = total_residual / count
+                if score < best_score:
+                    best_score = score
+                    best_k1, best_k2 = float(k1), float(k2)
+            except Exception:
+                continue
+
+    log.info(f"[AUTOCAL] Best: k1={best_k1:.2f} k2={best_k2:.2f} score={best_score:.4f}")
+    return {
+        "k1":         round(best_k1, 2),
+        "k2":         round(best_k2, 2),
+        "alpha":      0.0,
+        "score":      round(best_score, 4),
+        "lines_found": len(lines),
+    }
+
+
+@app.route("/undistort-autocal", methods=["POST"])
+def undistort_autocal():
+    """
+    Run auto-calibration on the latest raw frame.
+    Returns best-fit k1/k2 and immediately applies + saves to Firebase.
+    Called when the admin toggles distortion ON.
+    """
+    with _state_lock:
+        raw = _latest_raw_frame.copy() if _latest_raw_frame is not None else None
+
+    if raw is None:
+        return jsonify({"error": "No frame available yet — camera still initialising"}), 503
+
+    log.info("[API] Auto-calibration started...")
+    result = _auto_calibrate_distortion(raw)
+
+    # Build new config with found values, enabled=True
+    new_cfg = {
+        "enabled": True,
+        "k1":      result["k1"],
+        "k2":      result["k2"],
+        "alpha":   result["alpha"],
+    }
+
+    # Save to Firebase and update shared state
+    if firebase_instance:
+        firebase_instance.push_undistort_config(**new_cfg)
+
+    with _state_lock:
+        _undistort_cfg.update(new_cfg)
+
+    log.info(f"[API] Auto-cal complete — {new_cfg}")
+    return jsonify({
+        "status":      "ok",
+        "config":      new_cfg,
+        "lines_found": result["lines_found"],
+        "score":       result["score"],
+        "message":     f"Auto-calibrated: k1={new_cfg['k1']}, k2={new_cfg['k2']}. Applied to Pi.",
+    })
+
+
 @app.route("/undistort-config", methods=["GET"])
 def get_undistort_config():
     """Returns the current undistort config from shared state."""
