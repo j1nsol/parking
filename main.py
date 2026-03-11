@@ -47,7 +47,7 @@ def main():
         rtsp_url=RTSP_URL,
         confidence=0.20,
         target_classes=[2, 5, 7],   # COCO: car, bus, truck
-        undistort=True,              # Enable fisheye correction
+        undistort=False,              # Enable fisheye correction
         fov_degrees=FOV_DEGREES,
         zoom=ZOOM,
     )
