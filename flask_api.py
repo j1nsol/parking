@@ -51,14 +51,14 @@ def check_overlap(vbox, slot_coords):
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
-
+RTSP_URL = "rtsp://admin:Skibidi1@192.168.1.142:554/Streaming/Channels/101"
 @app.route("/status", methods=["GET"])
 def status():
     """
     Web app calls this to check if the Pi is reachable.
     Returns camera availability and slot count.
     """
-    cam = cv2.VideoCapture(0)
+    cam = cv2.VideoCapture(RTSP_URL, cv2.CAP_FFMPEG)
     cam_ok = cam.isOpened()
     cam.release()
     return jsonify({

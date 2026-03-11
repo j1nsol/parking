@@ -32,9 +32,11 @@ def main():
     )
 
     # 3. Initialize YOLO detector
+    RTSP_URL = "rtsp://admin:Skibidi1@192.168.1.142:554/Streaming/Channels/101"
+
     detector = ParkingDetector(
         model_path="yolov5n.pt",   # downloads automatically on first run
-        camera_index=0,            # USB camera
+        rtsp_url=RTSP_URL,           # USB camera
         confidence=0.45,
         target_classes=[2, 5, 7],  # COCO: car, bus, truck
     )

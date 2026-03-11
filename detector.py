@@ -12,10 +12,11 @@ log = logging.getLogger(__name__)
 
 
 class ParkingDetector:
+    RTSP_URL = "rtsp://admin:Skibidi1@192.168.1.142:554/Streaming/Channels/101"
     def __init__(
         self,
         model_path: str = "yolov5n.pt",
-        camera_index: int = 0,
+        rtsp_url: str = RTSP_URL,
         confidence: float = 0.45,
         target_classes: list = None,
         smoothing_window: int = 5,
@@ -37,11 +38,10 @@ class ParkingDetector:
         self.model = YOLO(model_path)
 
         # Open camera
-        self.cap = cv2.VideoCapture(camera_index)
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+        self.cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         if not self.cap.isOpened():
-            raise RuntimeError(f"Cannot open camera index {camera_index}")
+            raise RuntimeError(f"Cannot open camera index {rtsp_url}")
         log.info("Camera opened successfully.")
 
         # Smoothing history: slot_id -> deque of recent statuses
@@ -50,10 +50,15 @@ class ParkingDetector:
     # ------------------------------------------------------------------
     # Frame capture
     # ------------------------------------------------------------------
-    def capture_frame(self) -> np.ndarray | None:
-        """Capture one frame from the camera."""
+    def capture_frame(self):
+    ret, frame = self.cap.read()
+    if not ret:
+        log.warning("RTSP stream lost — reconnecting...")
+        self.cap.release()
+        self.cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_FFMPEG)
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         ret, frame = self.cap.read()
-        return frame if ret else None
+    return frame if ret else None
 
     # ------------------------------------------------------------------
     # Vehicle detection
