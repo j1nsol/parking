@@ -23,8 +23,8 @@ app = Flask(__name__)
 CORS(app)  # Allow web app on PC to call this API
 
 # ── Load YOLO once at startup ─────────────────────────────────────────────────
-print("Loading YOLOv5n model...")
-model = YOLO("yolov5nu.pt")
+print("Loading YOLOv8n model...")
+model = YOLO("yolov8n.pt")
 print("Model ready.")
 
 # ── Load slot config if it exists ─────────────────────────────────────────────
