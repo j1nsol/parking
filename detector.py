@@ -27,7 +27,7 @@ class ParkingDetector:
         confidence: float = 0.20,
         target_classes: list = None,
         smoothing_window: int = 5,
-        undistort: bool = false,
+        undistort: bool = False,
         fov_degrees: float = 185.0,
         zoom: float = 0.7,
     ):
