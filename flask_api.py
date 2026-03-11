@@ -44,7 +44,7 @@ TARGET_CLASSES = [2, 5, 7]   # COCO: car, bus, truck
 IOU_THRESHOLD  = 0.35
 SMOOTHING_WIN  = 5            # frames for majority-vote smoothing
 DETECT_INTERVAL = 1.0         # seconds between detection cycles
-FIREBASE_EVERY  = 2           # push Firebase every N detection cycles
+FIREBASE_EVERY  = 3           # push Firebase every N detection cycles
 
 # Fisheye undistortion — set UNDISTORT=True if your camera needs it
 UNDISTORT   = False
