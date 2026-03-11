@@ -83,6 +83,16 @@ _undistort_cfg = {
     "alpha":   0.0,
 }
 
+# ── Shared program config — hot-reloaded from Firebase ───────────────────────
+_prog_cfg = {
+    "confidence":      CONFIDENCE,
+    "iou_threshold":   IOU_THRESHOLD,
+    "smoothing_win":   SMOOTHING_WIN,
+    "detect_interval": DETECT_INTERVAL,
+    "firebase_every":  FIREBASE_EVERY,
+    "yolo_every_n":    1,
+}
+
 # ── Load existing slot config if present ─────────────────────────────────────
 if os.path.exists(SLOT_CONFIG):
     with open(SLOT_CONFIG) as f:
@@ -100,16 +110,25 @@ def _check_overlap(vbox, slot_coords):
     ix2, iy2 = min(vx2, sx2), min(vy2, sy2)
     inter     = max(0, ix2 - ix1) * max(0, iy2 - iy1)
     slot_area = max(1, (sx2 - sx1) * (sy2 - sy1))
-    return (inter / slot_area) >= IOU_THRESHOLD
+    with _state_lock:
+        threshold = _prog_cfg["iou_threshold"]
+    return (inter / slot_area) >= threshold
 
 
 def _apply_smoothing(statuses: dict) -> dict:
     """Majority-vote temporal smoothing — mutates and returns statuses."""
+    with _state_lock:
+        win = _prog_cfg["smoothing_win"]
     for slot_id, status in statuses.items():
         if slot_id not in _smoothing_hist:
-            _smoothing_hist[slot_id] = deque(maxlen=SMOOTHING_WIN)
+            _smoothing_hist[slot_id] = deque(maxlen=win)
+        # Resize deque if window changed
+        if _smoothing_hist[slot_id].maxlen != win:
+            _smoothing_hist[slot_id] = deque(
+                list(_smoothing_hist[slot_id])[-win:], maxlen=win
+            )
         _smoothing_hist[slot_id].append(1 if status == "Occupied" else 0)
-        majority = sum(_smoothing_hist[slot_id]) > (SMOOTHING_WIN // 2)
+        majority = sum(_smoothing_hist[slot_id]) > (win // 2)
         statuses[slot_id] = "Occupied" if majority else "Vacant"
     return statuses
 
@@ -255,8 +274,20 @@ def _detection_loop():
         except Exception as e:
             log.warning(f"[BG] Could not fetch initial undistort config: {e}")
 
-    sample_saved = False
+    # ── Fetch initial program config ──────────────────────────────────────────
+    if firebase:
+        try:
+            initial_prog = firebase.get_program_config()
+            with _state_lock:
+                _prog_cfg.update(initial_prog)
+            log.info(f"[BG] Program config loaded: {initial_prog}")
+        except Exception as e:
+            log.warning(f"[BG] Could not fetch initial program config: {e}")
+
+    sample_saved      = False
     local_frame_count = 0
+    last_prog_check   = 0
+    last_yolo_frame   = None   # last YOLO result, reused on skipped frames
 
     _open_camera()
 
@@ -285,10 +316,11 @@ def _detection_loop():
                     _mapping_phase = True
                 log.info("[BG] Mapper reset. Starting fresh mapping phase (~150 frames)...")
 
-            # ── Poll Firebase for undistort config changes every 5s ───────────
+            # ── Poll Firebase for config changes every 5s ─────────────────────
             now = time.time()
             if firebase and (now - last_cfg_check) >= UNDISTORT_POLL_INTERVAL:
                 last_cfg_check = now
+                # Undistort config
                 try:
                     new_cfg = firebase.get_undistort_config()
                     if new_cfg != active_cfg:
@@ -299,6 +331,22 @@ def _detection_loop():
                             _undistort_cfg.update(active_cfg)
                 except Exception as e:
                     log.warning(f"[BG] Undistort config poll failed: {e}")
+                # Program config
+                try:
+                    new_prog = firebase.get_program_config()
+                    with _state_lock:
+                        if new_prog != _prog_cfg:
+                            log.info(f"[BG] Program config changed: {new_prog}")
+                            _prog_cfg.update(new_prog)
+                except Exception as e:
+                    log.warning(f"[BG] Program config poll failed: {e}")
+
+            # Read live program config values once per loop iteration
+            with _state_lock:
+                conf            = _prog_cfg["confidence"]
+                detect_interval = _prog_cfg["detect_interval"]
+                firebase_every  = _prog_cfg["firebase_every"]
+                yolo_every_n    = _prog_cfg["yolo_every_n"]
 
             # Save undistort preview once on startup
             if not sample_saved and undistorter:
@@ -314,17 +362,21 @@ def _detection_loop():
             if undistorter:
                 frame = undistorter.process(frame)
 
-            # ── Run YOLO ──────────────────────────────────────────────────────
-            results = model(frame, conf=CONFIDENCE, classes=TARGET_CLASSES, verbose=False)
-            vehicle_boxes = []
-            for r in results:
-                for box in r.boxes:
-                    x1, y1, x2, y2 = box.xyxy[0].tolist()
-                    vehicle_boxes.append({
-                        "coords":     [x1, y1, x2, y2],
-                        "confidence": round(float(box.conf[0]), 3),
-                        "label":      model.names[int(box.cls[0])],
-                    })
+            # ── Run YOLO (or reuse last result if skipping this frame) ─────────
+            if local_frame_count % max(1, yolo_every_n) == 0:
+                results = model(frame, conf=conf, classes=TARGET_CLASSES, verbose=False)
+                vehicle_boxes = []
+                for r in results:
+                    for box in r.boxes:
+                        x1, y1, x2, y2 = box.xyxy[0].tolist()
+                        vehicle_boxes.append({
+                            "coords":     [x1, y1, x2, y2],
+                            "confidence": round(float(box.conf[0]), 3),
+                            "label":      model.names[int(box.cls[0])],
+                        })
+                last_yolo_frame = vehicle_boxes
+            else:
+                vehicle_boxes = last_yolo_frame or []
 
             with _state_lock:
                 mapping_phase = _mapping_phase
@@ -350,7 +402,7 @@ def _detection_loop():
                         firebase.push_slot_layout(discovered)
 
                 local_frame_count += 1
-                time.sleep(DETECT_INTERVAL)
+                time.sleep(detect_interval)
                 continue
 
             # ── Phase 2: Occupancy Detection ──────────────────────────────────
@@ -383,19 +435,21 @@ def _detection_loop():
                 _latest_statuses = dict(statuses)
                 _frame_count     = local_frame_count
 
-            # Firebase push every FIREBASE_EVERY cycles
-            if firebase and local_frame_count % FIREBASE_EVERY == 0:
+            # Firebase push every firebase_every cycles
+            if firebase and local_frame_count % max(1, firebase_every) == 0:
                 firebase.push_occupancy(statuses)
 
             occupied = sum(1 for s in statuses.values() if s == "Occupied")
             log.info(
                 f"[BG] Frame {local_frame_count} | "
                 f"Occupied: {occupied}/{len(statuses)} | "
-                f"Vehicles: {len(vehicle_boxes)}"
+                f"Vehicles: {len(vehicle_boxes)} | "
+                f"conf={conf} iou={_prog_cfg['iou_threshold']} "
+                f"interval={detect_interval}s yolo_every={yolo_every_n}"
             )
 
             local_frame_count += 1
-            time.sleep(DETECT_INTERVAL)
+            time.sleep(detect_interval)
 
         except Exception as e:
             log.error(f"[BG] Unexpected error: {e}", exc_info=True)
@@ -546,6 +600,46 @@ def analyze_image():
         "occupied": occupied_count, "vacant": vacant_count,
         "occupancy_percent": round((occupied_count / max(1, len(current_slots))) * 100),
         "timestamp": int(time.time() * 1000),
+    })
+
+
+@app.route("/program-config", methods=["GET"])
+def get_program_config():
+    """Returns current live program config."""
+    with _state_lock:
+        return jsonify(dict(_prog_cfg))
+
+
+@app.route("/program-config", methods=["POST"])
+def set_program_config():
+    """
+    Admin endpoint — write new program config to Firebase.
+    Background thread picks it up within 5 seconds.
+    """
+    data = request.get_json(silent=True) or {}
+    with _state_lock:
+        current = dict(_prog_cfg)
+
+    new_cfg = {
+        "confidence":      max(0.05, min(0.9,  float(data.get("confidence",      current["confidence"])))),
+        "iou_threshold":   max(0.1,  min(0.9,  float(data.get("iou_threshold",   current["iou_threshold"])))),
+        "smoothing_win":   max(1,    min(30,   int(data.get("smoothing_win",     current["smoothing_win"])))),
+        "detect_interval": max(0.0,  min(5.0,  float(data.get("detect_interval", current["detect_interval"])))),
+        "firebase_every":  max(1,    min(30,   int(data.get("firebase_every",    current["firebase_every"])))),
+        "yolo_every_n":    max(1,    min(10,   int(data.get("yolo_every_n",      current["yolo_every_n"])))),
+    }
+
+    if firebase_instance:
+        firebase_instance.push_program_config(new_cfg)
+
+    with _state_lock:
+        _prog_cfg.update(new_cfg)
+
+    log.info(f"[API] Program config updated: {new_cfg}")
+    return jsonify({
+        "status":  "ok",
+        "config":  new_cfg,
+        "message": "Program config saved. Pi will apply within 5 seconds.",
     })
 
 

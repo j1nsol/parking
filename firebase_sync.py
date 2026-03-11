@@ -17,6 +17,15 @@ DEFAULT_UNDISTORT_CONFIG = {
     "alpha":   0.0,
 }
 
+DEFAULT_PROGRAM_CONFIG = {
+    "confidence":       0.20,
+    "iou_threshold":    0.35,
+    "smoothing_win":    5,
+    "detect_interval":  1.0,
+    "firebase_every":   2,
+    "yolo_every_n":     1,
+}
+
 
 class FirebaseSync:
     def __init__(self, credentials_path: str, database_url: str):
@@ -131,3 +140,48 @@ class FirebaseSync:
             log.info(f"[FB] Undistort config pushed: {payload}")
         except Exception as e:
             log.warning(f"Failed to push undistort config: {e}")
+
+    # ------------------------------------------------------------------
+    # Program config — read / write / init
+    # ------------------------------------------------------------------
+    def get_program_config(self) -> dict:
+        """
+        Read program config from Firebase.
+        Returns stored config, or DEFAULT_PROGRAM_CONFIG if not set yet.
+        Seeds defaults on first run.
+        """
+        try:
+            ref = db.reference("/program_config")
+            val = ref.get()
+            if val is None:
+                ref.set(DEFAULT_PROGRAM_CONFIG)
+                log.info("[FB] Program config initialised with defaults.")
+                return dict(DEFAULT_PROGRAM_CONFIG)
+            d = DEFAULT_PROGRAM_CONFIG
+            return {
+                "confidence":      float(val.get("confidence",      d["confidence"])),
+                "iou_threshold":   float(val.get("iou_threshold",   d["iou_threshold"])),
+                "smoothing_win":   int(val.get("smoothing_win",     d["smoothing_win"])),
+                "detect_interval": float(val.get("detect_interval", d["detect_interval"])),
+                "firebase_every":  int(val.get("firebase_every",    d["firebase_every"])),
+                "yolo_every_n":    int(val.get("yolo_every_n",      d["yolo_every_n"])),
+            }
+        except Exception as e:
+            log.warning(f"Failed to read program config — using defaults: {e}")
+            return dict(DEFAULT_PROGRAM_CONFIG)
+
+    def push_program_config(self, cfg: dict):
+        """Write program config to Firebase."""
+        payload = {
+            "confidence":      round(float(cfg["confidence"]),      2),
+            "iou_threshold":   round(float(cfg["iou_threshold"]),   2),
+            "smoothing_win":   int(cfg["smoothing_win"]),
+            "detect_interval": round(float(cfg["detect_interval"]), 1),
+            "firebase_every":  int(cfg["firebase_every"]),
+            "yolo_every_n":    int(cfg["yolo_every_n"]),
+        }
+        try:
+            db.reference("/program_config").set(payload)
+            log.info(f"[FB] Program config pushed: {payload}")
+        except Exception as e:
+            log.warning(f"Failed to push program config: {e}")
