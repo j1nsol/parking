@@ -22,7 +22,7 @@ class FisheyeUndistorter:
         self,
         fov_degrees: float = 185.0,   # typical wide-angle fisheye FOV
         zoom: float = 0.7,            # 0.5–1.0 — higher = more of frame kept
-        balance: float = 0.0,         # 0.0 = no black edges, 1.0 = full frame
+        balance: float = 0.5,         # 0.0 = no black edges, 1.0 = full frame
     ):
         """
         Args:
@@ -30,7 +30,7 @@ class FisheyeUndistorter:
                          Try 185 first. If result looks stretched, lower to 160.
             zoom:        How much of the undistorted image to keep.
                          Lower = more zoomed in but fewer black corners.
-            balance:     0.0 crops black edges out. 1.0 keeps full distorted FOV.
+            balance:     0.5 balances cropping vs black edges. 0.0 = no black edges (aggressive crop), 1.0 = full frame.
         """
         self.fov = fov_degrees
         self.zoom = zoom
@@ -48,7 +48,14 @@ class FisheyeUndistorter:
         # Principal point = image center, focal length from FOV
         cx, cy = w / 2.0, h / 2.0
         fov_rad = np.deg2rad(self.fov / 2.0)
-        f = cx / np.tan(fov_rad)
+
+        # tan() goes negative for half-FOV > 90° (i.e. total FOV > 180°).
+        # Use abs() so the focal length stays positive and the K matrix stays valid.
+        f = abs(cx / np.tan(fov_rad))
+        # For very wide FOV where tan is near zero, fall back to a safe estimate
+        if f < 1.0:
+            f = cx * 0.5
+            log.warning(f"FOV {self.fov}° produced near-zero focal length — using fallback f={f:.1f}")
 
         K = np.array([
             [f,   0,  cx],
