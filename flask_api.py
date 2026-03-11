@@ -66,6 +66,7 @@ log.info("Model ready.")
 # Using RLock so the bg thread can acquire it re-entrantly if needed.
 _state_lock      = threading.RLock()
 _latest_frame    = None          # Last annotated JPEG bytes (ready to serve)
+_latest_raw_frame = None         # Last raw frame (numpy array) for preview endpoint
 _latest_statuses = {}            # slot_id -> "Occupied" | "Vacant"
 _slots           = {}            # slot_id -> {coords, row, ...}
 _smoothing_hist  = {}            # slot_id -> deque for temporal smoothing
@@ -191,7 +192,7 @@ def _detection_loop():
     Owns: camera, YOLO inference, auto-mapper, Firebase sync, smoothing.
     Writes results into shared state for Flask routes to read.
     """
-    global _latest_frame, _latest_statuses, _slots, _mapping_phase, _frame_count, _last_fb_push, firebase_instance
+    global _latest_frame, _latest_raw_frame, _latest_statuses, _slots, _mapping_phase, _frame_count, _last_fb_push, firebase_instance
 
     # ── Firebase ──────────────────────────────────────────────────────────────
     firebase = None
@@ -281,6 +282,10 @@ def _detection_loop():
                 undistorter.save_sample(frame, "undistort_sample.jpg")
                 log.info("[BG] Saved undistort_sample.jpg")
                 sample_saved = True
+
+            # Store raw frame for preview endpoint BEFORE undistortion
+            with _state_lock:
+                _latest_raw_frame = frame.copy()
 
             # Apply undistortion
             if undistorter:
@@ -566,44 +571,53 @@ def set_undistort_config():
 @app.route("/undistort-preview", methods=["GET"])
 def undistort_preview():
     """
-    Grabs one fresh frame, applies current undistort settings,
-    and returns a side-by-side before/after JPEG.
+    Uses the last raw frame captured by the bg thread (no camera access here),
+    applies current undistort settings, and returns a side-by-side JPEG.
+    Always shows original vs undistorted regardless of enabled toggle,
+    so you can see what the correction looks like before committing.
     Called manually from the admin panel — not polled.
     """
-    frame = _get_raw_frame()
-    if frame is None:
+    with _state_lock:
+        raw = _latest_raw_frame.copy() if _latest_raw_frame is not None else None
+        cfg = dict(_undistort_cfg)
+
+    if raw is None:
         placeholder = np.zeros((400, 1280, 3), dtype=np.uint8)
-        cv2.putText(placeholder, "Camera unavailable", (400, 200),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.2, (80, 80, 80), 2)
+        cv2.putText(placeholder, "No frame yet — camera may still be initialising",
+                    (140, 200), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (80, 80, 80), 2)
         _, buf = cv2.imencode(".jpg", placeholder)
         return Response(buf.tobytes(), mimetype="image/jpeg")
 
-    with _state_lock:
-        cfg = dict(_undistort_cfg)
+    # Always apply undistortion for the preview so you can compare
+    # regardless of whether the toggle is currently enabled
+    try:
+        from undistort import FisheyeUndistorter
+        u = FisheyeUndistorter(fov_degrees=cfg["fov_degrees"], zoom=cfg["zoom"])
+        corrected = u.process(raw.copy())
+    except Exception as e:
+        log.warning(f"[PREVIEW] Undistort failed: {e}")
+        corrected = raw.copy()
 
-    if cfg.get("enabled", False):
-        try:
-            from undistort import FisheyeUndistorter
-            u = FisheyeUndistorter(fov_degrees=cfg["fov_degrees"], zoom=cfg["zoom"])
-            corrected = u.process(frame.copy())
-        except Exception as e:
-            log.warning(f"[PREVIEW] Undistort failed: {e}")
-            corrected = frame.copy()
-    else:
-        corrected = frame.copy()
-
-    # Label each side
-    orig = frame.copy()
+    orig = raw.copy()
     h, w = orig.shape[:2]
-    for img, label in [(orig, "ORIGINAL"), (corrected, f"UNDISTORTED  FOV={cfg['fov_degrees']}  zoom={cfg['zoom']}")]:
-        cv2.rectangle(img, (0, 0), (w, 38), (7, 10, 16), -1)
-        cv2.putText(img, label, (12, 26),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.75,
-                    (80, 80, 80) if not cfg.get("enabled") else (80, 200, 120), 2)
+
+    # Label banners
+    enabled_str = "ENABLED" if cfg.get("enabled") else "DISABLED (preview only)"
+    for img, label, color in [
+        (orig,      "ORIGINAL",  (100, 100, 100)),
+        (corrected, f"UNDISTORTED  FOV={cfg['fov_degrees']}°  zoom={cfg['zoom']}  [{enabled_str}]",
+                                 (80, 200, 120) if cfg.get("enabled") else (56, 189, 248)),
+    ]:
+        cv2.rectangle(img, (0, 0), (w, 42), (7, 10, 16), -1)
+        cv2.putText(img, label, (12, 28),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2, cv2.LINE_AA)
 
     side_by_side = np.hstack([orig, corrected])
-    out = cv2.resize(side_by_side, (1280, 360))
-    _, buf = cv2.imencode(".jpg", out, [cv2.IMWRITE_JPEG_QUALITY, 80])
+    # Resize to fit browser width while keeping aspect ratio
+    out_w = 1280
+    out_h = int(h * (out_w / (w * 2)))
+    out = cv2.resize(side_by_side, (out_w, out_h))
+    _, buf = cv2.imencode(".jpg", out, [cv2.IMWRITE_JPEG_QUALITY, 82])
     return Response(
         buf.tobytes(),
         mimetype="image/jpeg",
