@@ -103,7 +103,27 @@ if os.path.exists(SLOT_CONFIG):
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _check_overlap(vbox, slot_coords):
+def _is_quad(coords) -> bool:
+    """True if coords is a list of 4 [x,y] points (quad), False if flat [x1,y1,x2,y2]."""
+    return (isinstance(coords, list) and len(coords) == 4
+            and isinstance(coords[0], (list, tuple)))
+
+
+def _check_overlap(vbox, slot_coords) -> bool:
+    """
+    Returns True if the vehicle bounding box center falls inside the slot.
+    Supports both quad [[x,y]×4] and legacy rect [x1,y1,x2,y2] coords.
+    Quad uses point-in-polygon (no threshold needed).
+    Rect uses IoU overlap with the configurable iou_threshold.
+    """
+    cx = (vbox[0] + vbox[2]) / 2
+    cy = (vbox[1] + vbox[3]) / 2
+
+    if _is_quad(slot_coords):
+        contour = np.array(slot_coords, dtype=np.float32)
+        return cv2.pointPolygonTest(contour, (float(cx), float(cy)), False) >= 0
+
+    # Legacy rect fallback
     vx1, vy1, vx2, vy2 = vbox
     sx1, sy1, sx2, sy2 = slot_coords
     ix1, iy1 = max(vx1, sx1), max(vy1, sy1)
@@ -134,19 +154,27 @@ def _apply_smoothing(statuses: dict) -> dict:
 
 
 def _draw_boxes(frame, vehicle_boxes, slot_results=None):
-    """Draw YOLO vehicle boxes and slot overlays onto a frame."""
+    """Draw YOLO vehicle boxes and slot overlays. Supports quad and rect coords."""
     if slot_results:
         for slot in slot_results:
             coords = slot.get("coords")
-            if not coords or len(coords) < 4:
+            if not coords:
                 continue
-            x1, y1, x2, y2 = [int(c) for c in coords]
             occ   = slot["status"] == "Occupied"
             color = (60, 60, 220) if occ else (80, 200, 120)
-            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
             label = f"{slot['id']} {'OCC' if occ else 'VAC'}"
-            cv2.putText(frame, label, (x1 + 4, y1 + 22),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA)
+
+            if _is_quad(coords):
+                pts = np.array(coords, dtype=np.int32)
+                cv2.polylines(frame, [pts], isClosed=True, color=color, thickness=3)
+                lx, ly = coords[0]
+                cv2.putText(frame, label, (lx + 4, ly + 22),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA)
+            else:
+                x1, y1, x2, y2 = [int(c) for c in coords]
+                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
+                cv2.putText(frame, label, (x1 + 4, y1 + 22),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA)
 
     for vb in vehicle_boxes:
         x1, y1, x2, y2 = [int(c) for c in vb["coords"]]
@@ -877,8 +905,7 @@ def undistort_preview():
 def trigger_remap():
     """
     Admin endpoint — signals the bg thread to reset the AutoMapper object
-    and restart the mapping phase. Uses a flag so the bg thread handles
-    the reset itself, avoiding race conditions with the mapper object.
+    and restart the mapping phase.
     """
     global _remap_requested
     with _state_lock:
@@ -887,7 +914,60 @@ def trigger_remap():
     if os.path.exists(SLOT_CONFIG):
         os.remove(SLOT_CONFIG)
     log.info("[ADMIN] Remap requested — bg thread will reset mapper on next frame.")
-    return jsonify({"status": "remap_started", "message": "Auto-mapping restarted. ~150 frames needed."})
+    return jsonify({"status": "remap_started", "message": "Auto-mapping restarted."})
+
+
+@app.route("/slots/<slot_id>", methods=["PUT"])
+def update_slot(slot_id):
+    """
+    Admin endpoint — update a single slot's quad coordinates.
+    Body: { "coords": [[x1,y1],[x2,y2],[x3,y3],[x4,y4]] }
+    Used by the Slot Editor tab for manual point adjustment.
+    """
+    global _slots
+    data = request.get_json(silent=True) or {}
+    coords = data.get("coords")
+
+    if not coords or len(coords) != 4:
+        return jsonify({"error": "coords must be a list of 4 [x,y] points"}), 400
+
+    with _state_lock:
+        if slot_id not in _slots:
+            return jsonify({"error": f"Slot {slot_id} not found"}), 404
+        _slots[slot_id]["coords"] = coords
+        _slots[slot_id]["source"] = "manual"
+        current = dict(_slots)
+
+    # Persist to disk
+    with open(SLOT_CONFIG, "w") as f:
+        json.dump(current, f, indent=2)
+
+    # Push to Firebase
+    if firebase_instance:
+        firebase_instance.push_slot_layout(current)
+
+    log.info(f"[ADMIN] Slot {slot_id} updated manually.")
+    return jsonify({"status": "ok", "slot_id": slot_id, "coords": coords})
+
+
+@app.route("/slots/<slot_id>", methods=["DELETE"])
+def delete_slot(slot_id):
+    """Admin endpoint — permanently remove a slot."""
+    global _slots
+    with _state_lock:
+        if slot_id not in _slots:
+            return jsonify({"error": f"Slot {slot_id} not found"}), 404
+        _slots.pop(slot_id)
+        current = dict(_slots)
+
+    with open(SLOT_CONFIG, "w") as f:
+        json.dump(current, f, indent=2)
+
+    if firebase_instance:
+        firebase_instance.push_slot_layout(current)
+
+    log.info(f"[ADMIN] Slot {slot_id} deleted.")
+    return jsonify({"status": "ok", "slot_id": slot_id})
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -896,7 +976,6 @@ if __name__ == "__main__":
     print(f"RTSP  : {RTSP_URL}")
     print(f"API   : http://<PI_IP>:5000")
     print("Routes: /status  /slots  /occupancy  /live-frame  /analyze-image  /remap")
+    print("        /slots/<id> PUT/DELETE  /program-config  /undistort-config")
     print("=========================================\n")
-    # threaded=True is now safe — Flask routes only READ shared state via lock.
-    # The camera is exclusively owned by the background daemon thread.
     app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)
