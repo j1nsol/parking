@@ -1,20 +1,18 @@
 """
 auto_mapper.py — Automatically discovers parking slot layout from video.
 
-How it works:
-  1. Collect bounding boxes of detected vehicles over many frames.
-  2. Cluster box centers with DBSCAN to find occupied parking positions.
-  3. Average the boxes in each cluster → slot boundary.
-  4. Infer likely empty slots from spatial gaps in the cluster grid.
-  5. Save results to slot_config.json.
+Strategy:
+  1. Track each detected vehicle across consecutive frames.
+  2. Only accumulate a detection if the vehicle has been stationary for
+     at least MIN_STATIONARY_FRAMES consecutive frames. This filters out
+     cars driving through lanes, which move significantly between frames.
+  3. DBSCAN-cluster the stationary detections → each cluster = one slot.
+  4. Row-based empty slot inference fills gaps within rows only.
+  5. Save to slot_config.json.
 
-Key improvements over v1:
-  - Clustering triggers at >= min_frames (not == min_frames) so a reset
-    mid-count still works correctly.
-  - Empty slot inference: after finding occupied clusters, the mapper
-    analyses the spatial grid and fills in slot-sized gaps. This means
-    a slot that was never occupied during mapping is still discovered,
-    which is essential for demos where not all spots are filled.
+The stationarity filter is the critical addition over v1/v2:
+  - Parked car:       moves 0–8px between frames   → accumulated
+  - Drive-through car: moves 50–300px between frames → ignored
 """
 
 import json
@@ -25,41 +23,58 @@ from sklearn.cluster import DBSCAN
 
 log = logging.getLogger(__name__)
 
+# A detection is considered stationary if its center moves less than this
+# many pixels between consecutive frames.
+STATIONARY_THRESHOLD_PX = 20   # tune up if jitter causes misses, down if lane cars sneak in
+
+# How many consecutive stationary frames before we trust a detection
+MIN_STATIONARY_FRAMES = 5
+
 
 class AutoMapper:
     def __init__(
         self,
         slot_config_path: str = "slot_config.json",
-        min_frames_to_map: int = 150,
+        min_detections_to_map: int = 50,   # minimum accumulated stationary detections
         eps_pixels: int = 60,
-        min_samples: int = 3,
+        min_samples: int = 5,              # minimum stationary hits to form a slot cluster
         infer_empty_slots: bool = True,
-        gap_tolerance: float = 0.20,   # tighter: gap must be within 20% of expected distance
-        max_gap_multiplier: float = 2.4,  # gaps wider than 2.4× slot size = drive lane, skip
+        row_merge_tolerance: float = 0.6,
+        gap_tolerance: float = 0.22,
+        max_gap_multiplier: float = 2.3,
     ):
         """
         Args:
-            slot_config_path:    Where to save the discovered slot layout.
-            min_frames_to_map:   Minimum frames before mapping is attempted.
-            eps_pixels:          DBSCAN neighbourhood radius.
-            min_samples:         Minimum detections per cluster to count as a slot.
-            infer_empty_slots:   If True, infer slot-sized gaps as empty slots.
-            gap_tolerance:       Max fractional error allowed when matching gap to
-                                 expected slot spacing. 0.20 = must be within 20%.
-                                 Tighter = less false positives in drive lanes.
-            max_gap_multiplier:  Hard cap — pairs further apart than this multiple
-                                 of slot size are treated as separated by a drive
-                                 lane and are never used for inference.
+            slot_config_path:      Where to save the discovered slot layout.
+            min_detections_to_map: Minimum stationary detections before clustering.
+                                   Unlike frame count, this scales with how many
+                                   parked cars are seen — sparse lots take longer,
+                                   full lots map quickly.
+            eps_pixels:            DBSCAN neighbourhood radius (pixels).
+            min_samples:           Minimum stationary hits per cluster.
+                                   Higher = less sensitive to briefly-stopped cars.
+            infer_empty_slots:     Whether to infer empty slots from row gaps.
+            row_merge_tolerance:   Y-proximity threshold for row grouping
+                                   (fraction of slot height).
+            gap_tolerance:         How precisely a gap must match slot spacing.
+            max_gap_multiplier:    Gaps wider than this × slot size = drive lane.
         """
-        self.config_path       = slot_config_path
-        self.min_frames        = min_frames_to_map
-        self.eps               = eps_pixels
-        self.min_samples       = min_samples
-        self.infer_empty       = infer_empty_slots
-        self.gap_tolerance     = gap_tolerance
-        self.max_gap_mult      = max_gap_multiplier
+        self.config_path      = slot_config_path
+        self.min_detections   = min_detections_to_map
+        self.eps              = eps_pixels
+        self.min_samples      = min_samples
+        self.infer_empty      = infer_empty_slots
+        self.row_merge_tol    = row_merge_tolerance
+        self.gap_tolerance    = gap_tolerance
+        self.max_gap_mult     = max_gap_multiplier
 
+        # Accumulated stationary detections: list of (cx, cy, x1, y1, x2, y2)
         self._detections: list = []
+
+        # Per-vehicle tracking for stationarity check.
+        # Key: approximate center tuple, Value: {cx, cy, x1,y1,x2,y2, still_count}
+        self._tracked: dict    = {}
+
         self._frame_count      = 0
         self._slots: dict      = {}
 
@@ -70,39 +85,94 @@ class AutoMapper:
     # ------------------------------------------------------------------
     def feed_frame(self, vehicle_boxes: list, frame_shape: tuple):
         """
-        Accumulate vehicle detections. Clustering runs automatically once
-        min_frames have been collected.
+        Process one frame. Only stationary vehicles contribute to slot mapping.
 
         Args:
-            vehicle_boxes: List of [x1, y1, x2, y2] boxes from YOLO.
-            frame_shape:   (height, width, channels) of the frame.
+            vehicle_boxes: List of [x1, y1, x2, y2] from YOLO.
+            frame_shape:   (height, width, channels).
         """
         self._frame_count += 1
+
+        current_centers = []
         for box in vehicle_boxes:
             x1, y1, x2, y2 = box
             cx = (x1 + x2) / 2
             cy = (y1 + y2) / 2
-            self._detections.append((cx, cy, x1, y1, x2, y2))
+            current_centers.append((cx, cy, x1, y1, x2, y2))
 
-        # Use >= so this still fires even if frame_count overshoots min_frames
-        if self._frame_count >= self.min_frames and not self._slots:
+        # ── Match current detections to tracked vehicles ──────────────────────
+        new_tracked = {}
+        for cx, cy, x1, y1, x2, y2 in current_centers:
+            # Find the closest previously tracked vehicle
+            matched_key = None
+            best_dist   = STATIONARY_THRESHOLD_PX * 3  # search radius
+
+            for key, prev in self._tracked.items():
+                dist = np.hypot(cx - prev["cx"], cy - prev["cy"])
+                if dist < best_dist:
+                    best_dist   = dist
+                    matched_key = key
+
+            if matched_key is not None:
+                prev = self._tracked[matched_key]
+                movement = np.hypot(cx - prev["cx"], cy - prev["cy"])
+
+                if movement < STATIONARY_THRESHOLD_PX:
+                    # Vehicle hasn't moved — increment stationary counter
+                    still_count = prev["still_count"] + 1
+                else:
+                    # Vehicle moved — reset counter (driving through)
+                    still_count = 0
+
+                new_tracked[(round(cx), round(cy))] = {
+                    "cx": cx, "cy": cy,
+                    "x1": x1, "y1": y1, "x2": x2, "y2": y2,
+                    "still_count": still_count,
+                }
+
+                # Only accumulate once the vehicle has been still long enough
+                if still_count == MIN_STATIONARY_FRAMES:
+                    self._detections.append((cx, cy, x1, y1, x2, y2))
+                    log.debug(
+                        f"[MAPPER] Stationary vehicle confirmed at "
+                        f"({round(cx)}, {round(cy)}) — accumulated "
+                        f"(total: {len(self._detections)})"
+                    )
+            else:
+                # New vehicle — start tracking, not yet stationary
+                new_tracked[(round(cx), round(cy))] = {
+                    "cx": cx, "cy": cy,
+                    "x1": x1, "y1": y1, "x2": x2, "y2": y2,
+                    "still_count": 0,
+                }
+
+        self._tracked = new_tracked
+
+        # ── Trigger clustering once enough stationary detections accumulated ──
+        if len(self._detections) >= self.min_detections and not self._slots:
+            log.info(
+                f"[MAPPER] {len(self._detections)} stationary detections over "
+                f"{self._frame_count} frames — running clustering."
+            )
             self._run_clustering(frame_shape)
 
     # ------------------------------------------------------------------
     def _run_clustering(self, frame_shape: tuple):
         if len(self._detections) < self.min_samples:
-            log.warning("Not enough detections to build slot map.")
+            log.warning("Not enough stationary detections to build slot map.")
             return
 
         centers = np.array([[d[0], d[1]] for d in self._detections])
         labels  = DBSCAN(eps=self.eps, min_samples=self.min_samples).fit_predict(centers)
 
         cluster_ids = sorted(set(labels) - {-1})
-        log.info(f"DBSCAN found {len(cluster_ids)} occupied slot clusters from "
-                 f"{len(self._detections)} detections over {self._frame_count} frames.")
+        log.info(
+            f"DBSCAN: {len(cluster_ids)} slot clusters from "
+            f"{len(self._detections)} stationary detections."
+        )
 
-        slots = {}
-        cluster_boxes = []  # store for gap inference
+        slots        = {}
+        cluster_data = []
 
         for i, cid in enumerate(cluster_ids):
             mask = labels == cid
@@ -111,122 +181,122 @@ class AutoMapper:
                 for d, m in zip(self._detections, mask) if m
             ])
             avg_box = boxes.mean(axis=0).tolist()
+            cx = (avg_box[0] + avg_box[2]) / 2
+            cy = (avg_box[1] + avg_box[3]) / 2
             slot_id = f"S{i+1:02d}"
             slots[slot_id] = {
                 "coords": [round(v) for v in avg_box],
-                "row":    self._infer_row(avg_box[1], frame_shape[0]),
+                "row":    self._infer_row(cy, frame_shape[0]),
                 "source": "detected",
             }
-            cluster_boxes.append(avg_box)
+            cluster_data.append((cx, cy, avg_box))
 
-        # ── Infer empty slots from spatial gaps ───────────────────────────────
-        if self.infer_empty and len(cluster_boxes) >= 2:
-            inferred = self._infer_empty_slots(cluster_boxes, frame_shape, len(slots))
-            for sid, sdata in inferred.items():
-                slots[sid] = sdata
+        if self.infer_empty and len(cluster_data) >= 2:
+            inferred = self._infer_by_row(cluster_data, frame_shape, len(slots))
+            slots.update(inferred)
             if inferred:
-                log.info(f"Inferred {len(inferred)} additional empty slot(s) from spatial gaps.")
+                log.info(f"Row inference added {len(inferred)} empty slot(s).")
 
         self._slots = slots
         self._save_config()
 
     # ------------------------------------------------------------------
-    def _infer_empty_slots(
-        self, cluster_boxes: list, frame_shape: tuple, next_index: int
+    def _infer_by_row(
+        self, cluster_data: list, frame_shape: tuple, next_index: int
     ) -> dict:
         """
-        Look for slot-sized gaps between discovered clusters and add them
-        as empty slots. Works by:
-
-        1. Computing median slot width (W) and height (H) from existing clusters.
-        2. For each pair of nearby clusters, checking if the gap between their
-           centers is close to W or H (i.e. one slot-width apart with nothing
-           detected in between).
-        3. Placing a new slot at the midpoint of the gap with the same W/H.
-
-        This is intentionally conservative — it only infers gaps that look
-        exactly like "one slot is missing" between two detected slots.
+        Group detected slots into rows by Y proximity, then fill
+        exactly-one-slot-sized gaps within each row only.
         """
-        boxes  = np.array(cluster_boxes)   # shape (N, 4): x1 y1 x2 y2
+        boxes   = np.array([d[2] for d in cluster_data])
         widths  = boxes[:, 2] - boxes[:, 0]
         heights = boxes[:, 3] - boxes[:, 1]
-        med_w  = float(np.median(widths))
-        med_h  = float(np.median(heights))
+        med_h   = float(np.median(heights))
 
-        centers = np.array([
-            [(b[0]+b[2])/2, (b[1]+b[3])/2] for b in cluster_boxes
-        ])
+        y_threshold = med_h * self.row_merge_tol
+        points = [(d[0], d[1], d[2]) for d in cluster_data]
+        points.sort(key=lambda p: p[1])
 
-        inferred = {}
-        seen_positions = set(map(tuple, centers.round(0).tolist()))
+        rows: list[list] = []
+        for pt in points:
+            placed = False
+            for row in rows:
+                row_cy = np.mean([r[1] for r in row])
+                if abs(pt[1] - row_cy) < y_threshold:
+                    row.append(pt)
+                    placed = True
+                    break
+            if not placed:
+                rows.append([pt])
 
-        # Hard cap — any pair further apart than this is separated by a lane, not a slot
-        max_allowed_dist = max(med_w, med_h) * self.max_gap_mult
+        log.info(
+            f"Row grouping: {len(cluster_data)} clusters → {len(rows)} rows "
+            f"(y_threshold={y_threshold:.0f}px)"
+        )
 
-        for i in range(len(centers)):
-            for j in range(i+1, len(centers)):
-                dx = centers[j][0] - centers[i][0]
-                dy = centers[j][1] - centers[i][1]
-                dist = np.hypot(dx, dy)
+        inferred  = {}
+        seen_cx   = set(round(d[0]) for d in cluster_data)
+        seen_cy   = set(round(d[1]) for d in cluster_data)
+        max_dist  = float(np.median(widths + heights)) * self.max_gap_mult
 
-                # Reject immediately if too far apart — it's a drive lane gap
-                if dist > max_allowed_dist:
+        for row_idx, row in enumerate(rows):
+            if len(row) < 2:
+                continue
+            row.sort(key=lambda p: p[0])
+
+            for k in range(len(row) - 1):
+                cx_a, cy_a, box_a = row[k]
+                cx_b, cy_b, box_b = row[k + 1]
+                dist = np.hypot(cx_b - cx_a, cy_b - cy_a)
+
+                if dist > max_dist:
+                    log.debug(f"  Row {row_idx}: gap {dist:.0f}px > max {max_dist:.0f}px — drive lane")
                     continue
 
-                # Check if gap ≈ 2× slot width (H) or 2× slot height (V)
-                # meaning exactly one slot is missing between them.
-                # gap_tolerance=0.20 means dist must be within 20% of expected.
-                for expected, dim_w, dim_h, direction in [
-                    (med_w * 2, med_w, med_h, "H"),
-                    (med_h * 2, med_w, med_h, "V"),
-                ]:
-                    tol = expected * self.gap_tolerance
-                    if abs(dist - expected) < tol:
-                        # Gap midpoint = where the missing slot center should be
-                        mid_cx = (centers[i][0] + centers[j][0]) / 2
-                        mid_cy = (centers[i][1] + centers[j][1]) / 2
-                        mid_key = (round(mid_cx), round(mid_cy))
+                w_avg = ((box_a[2]-box_a[0]) + (box_b[2]-box_b[0])) / 2
+                h_avg = ((box_a[3]-box_a[1]) + (box_b[3]-box_b[1])) / 2
+                expected = np.hypot(w_avg, h_avg) * 1.1
+                tol      = expected * self.gap_tolerance
 
-                        # Skip if a cluster already exists near this midpoint
-                        already_exists = any(
-                            abs(mid_cx - p[0]) < med_w * 0.4 and
-                            abs(mid_cy - p[1]) < med_h * 0.4
-                            for p in seen_positions
-                        )
-                        if already_exists or mid_key in seen_positions:
-                            continue
+                if abs(dist - expected * 2) >= tol * 2:
+                    continue
 
-                        seen_positions.add(mid_key)
-                        x1 = mid_cx - dim_w / 2
-                        y1 = mid_cy - dim_h / 2
-                        x2 = mid_cx + dim_w / 2
-                        y2 = mid_cy + dim_h / 2
+                mid_cx = (cx_a + cx_b) / 2
+                mid_cy = (cy_a + cy_b) / 2
 
-                        slot_id = f"S{next_index+1:02d}"
-                        next_index += 1
-                        inferred[slot_id] = {
-                            "coords": [round(x1), round(y1), round(x2), round(y2)],
-                            "row":    self._infer_row(mid_cy, frame_shape[0]),
-                            "source": "inferred",
-                        }
-                        log.info(
-                            f"  → Inferred {slot_id} at ({round(mid_cx)}, {round(mid_cy)}) "
-                            f"direction={direction} gap={round(dist)}px expected={round(expected)}px"
-                        )
-                        break   # only infer one slot per pair
+                too_close = any(
+                    abs(mid_cx - sx) < w_avg * 0.35 and abs(mid_cy - sy) < h_avg * 0.35
+                    for sx, sy in zip(seen_cx, seen_cy)
+                )
+                if too_close:
+                    continue
+
+                slot_id = f"S{next_index + 1:02d}"
+                next_index += 1
+                inferred[slot_id] = {
+                    "coords": [
+                        round(mid_cx - w_avg/2), round(mid_cy - h_avg/2),
+                        round(mid_cx + w_avg/2), round(mid_cy + h_avg/2),
+                    ],
+                    "row":    self._infer_row(mid_cy, frame_shape[0]),
+                    "source": "inferred",
+                }
+                seen_cx.add(round(mid_cx))
+                seen_cy.add(round(mid_cy))
+                log.info(
+                    f"  → Inferred {slot_id} at ({round(mid_cx)}, {round(mid_cy)}) "
+                    f"row={row_idx} gap={dist:.0f}px"
+                )
 
         return inferred
 
     # ------------------------------------------------------------------
     def _infer_row(self, y_center: float, frame_height: int) -> str:
         ratio = y_center / frame_height
-        if ratio < 0.33:
-            return "A"
-        elif ratio < 0.66:
-            return "B"
+        if ratio < 0.33:  return "A"
+        elif ratio < 0.66: return "B"
         return "C"
 
-    # ------------------------------------------------------------------
     def _save_config(self):
         with open(self.config_path, "w") as f:
             json.dump(self._slots, f, indent=2)
@@ -236,7 +306,6 @@ class AutoMapper:
         with open(self.config_path) as f:
             self._slots = json.load(f)
 
-    # ------------------------------------------------------------------
     def is_mapping_complete(self) -> bool:
         return bool(self._slots)
 
