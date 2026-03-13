@@ -45,6 +45,9 @@ IOU_THRESHOLD  = 0.35
 SMOOTHING_WIN  = 5            # frames for majority-vote smoothing
 DETECT_INTERVAL = 1.0         # seconds between detection cycles
 FIREBASE_EVERY  = 2           # push Firebase every N detection cycles
+MAPPER_EPS_PX   = 40          # DBSCAN eps — max px between detections in same slot cluster.
+                               # Lower = tighter clusters, better separation of close cars.
+                               # Raise if valid slots are being split into multiple clusters.
 
 # Fisheye undistortion — values are live-fetched from Firebase every 5s.
 # These are only the startup fallback defaults used before Firebase responds.
@@ -261,6 +264,7 @@ def _detection_loop():
         slot_config_path=SLOT_CONFIG,
         min_frames_to_map=150,
         min_samples=3,
+        eps_pixels=MAPPER_EPS_PX,   # tune in config above if close cars merge into one cluster
     )
     with _state_lock:
         mapping_phase = _mapping_phase
@@ -512,10 +516,6 @@ def _stream_loop():
     cap = None
     interval = 1.0 / STREAM_FPS
 
-    # Fix #3: cache the undistorter — only rebuild when config actually changes
-    _cached_udist      = None
-    _cached_udist_cfg  = {}
-
     def open_cap():
         c = cv2.VideoCapture(RTSP_URL, cv2.CAP_FFMPEG)
         c.set(cv2.CAP_PROP_BUFFERSIZE, 1)
@@ -549,30 +549,18 @@ def _stream_loop():
             time.sleep(0.1)
             continue
 
-        # Apply undistortion if enabled — rebuild only when config changes
+        # Apply undistortion if enabled
         with _state_lock:
             udist_cfg = dict(_undistort_cfg)
         if udist_cfg.get("enabled"):
-            if udist_cfg != _cached_udist_cfg:
-                try:
-                    from undistort import WideAngleUndistorter
-                    _cached_udist     = WideAngleUndistorter(
-                        k1=udist_cfg["k1"], k2=udist_cfg["k2"], alpha=udist_cfg["alpha"]
-                    )
-                    _cached_udist_cfg = dict(udist_cfg)
-                    log.info("[STREAM] Undistorter rebuilt with new config.")
-                except Exception:
-                    _cached_udist = None
-            if _cached_udist is not None:
-                try:
-                    frame = _cached_udist.process(frame)
-                except Exception:
-                    pass
-        else:
-            # Distortion disabled — clear cached instance
-            if _cached_udist is not None:
-                _cached_udist     = None
-                _cached_udist_cfg = {}
+            try:
+                from undistort import WideAngleUndistorter
+                u = WideAngleUndistorter(
+                    k1=udist_cfg["k1"], k2=udist_cfg["k2"], alpha=udist_cfg["alpha"]
+                )
+                frame = u.process(frame)
+            except Exception:
+                pass
 
         # Read latest YOLO overlay (no lock held during draw — just stale data is fine)
         with _state_lock:
@@ -632,6 +620,7 @@ def status():
         "mapping_phase": mapping,
         "frame_count":   frame_count,
         "model":         "yolov8n",
+        "mapper_eps_px": MAPPER_EPS_PX,
         "timestamp":     int(time.time() * 1000),
     })
 
@@ -1076,10 +1065,10 @@ def trigger_remap():
     Admin endpoint — signals the bg thread to reset the AutoMapper object
     and restart the mapping phase.
     """
-    global _remap_requested, _smoothing_hist
+    global _remap_requested
     with _state_lock:
         _remap_requested = True
-        _smoothing_hist.clear()   # Fix #2: was assigning a local; .clear() mutates the real global
+        _smoothing_hist  = {}
     if os.path.exists(SLOT_CONFIG):
         os.remove(SLOT_CONFIG)
     log.info("[ADMIN] Remap requested — bg thread will reset mapper on next frame.")

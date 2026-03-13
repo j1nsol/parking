@@ -30,7 +30,9 @@ from sklearn.cluster import DBSCAN
 
 log = logging.getLogger(__name__)
 
-STATIONARY_THRESHOLD_PX = 20
+STATIONARY_THRESHOLD_PX = 12   # was 20 — lowered so slightly wobbling cars (e.g. dark/toy cars)
+                                # still count as stationary and accumulate cluster detections.
+                                # Raise back to 20 if legitimate parked cars are being skipped.
 MIN_STATIONARY_FRAMES   = 5
 ACCUM_EVERY             = 10
 
@@ -72,12 +74,12 @@ class AutoMapper:
     def __init__(
         self,
         slot_config_path: str = "slot_config.json",
-        min_frames_to_map: int = 150,   # Fix #1: was min_detections_to_map=50, callers pass min_frames_to_map=150
+        min_frames_to_map: int = 150,   # was min_detections_to_map=50; callers pass min_frames_to_map=150
         eps_pixels: int = 60,
         min_samples: int = 5,
         infer_empty_slots: bool = True,
         row_merge_tolerance: float = 0.6,
-        gap_tolerance: float = 0.22,    # NOTE #11: gap-fill math assumes equal slot spacing;
+        gap_tolerance: float = 0.22,    # NOTE: gap-fill assumes equal slot spacing;
         max_gap_multiplier: float = 2.3, # unequally-spaced lots may miss some inferred slots.
     ):
         self.config_path    = slot_config_path
