@@ -34,21 +34,22 @@ class AutoMapper:
         eps_pixels: int = 60,
         min_samples: int = 3,
         infer_empty_slots: bool = True,
-        gap_tolerance: float = 0.55,   # how similar a gap must be to avg slot size (0–1)
+        gap_tolerance: float = 0.20,   # tighter: gap must be within 20% of expected distance
+        max_gap_multiplier: float = 2.4,  # gaps wider than 2.4× slot size = drive lane, skip
     ):
         """
         Args:
-            slot_config_path:  Where to save the discovered slot layout.
-            min_frames_to_map: Minimum frames before mapping is attempted.
-                               Lowered to 150 (from 300) — faster for demos.
-            eps_pixels:        DBSCAN neighbourhood radius. Increase if cars in
-                               adjacent slots are being merged into one cluster.
-            min_samples:       Minimum detections per cluster to count as a slot.
-                               Low value (3) means even briefly-seen positions count.
-            infer_empty_slots: If True, analyse spatial gaps between discovered
-                               clusters and add slot-sized empty slots automatically.
-            gap_tolerance:     How close a gap must be to the median slot width/height
-                               to be considered a missing slot (0.55 = within 55%).
+            slot_config_path:    Where to save the discovered slot layout.
+            min_frames_to_map:   Minimum frames before mapping is attempted.
+            eps_pixels:          DBSCAN neighbourhood radius.
+            min_samples:         Minimum detections per cluster to count as a slot.
+            infer_empty_slots:   If True, infer slot-sized gaps as empty slots.
+            gap_tolerance:       Max fractional error allowed when matching gap to
+                                 expected slot spacing. 0.20 = must be within 20%.
+                                 Tighter = less false positives in drive lanes.
+            max_gap_multiplier:  Hard cap — pairs further apart than this multiple
+                                 of slot size are treated as separated by a drive
+                                 lane and are never used for inference.
         """
         self.config_path       = slot_config_path
         self.min_frames        = min_frames_to_map
@@ -56,6 +57,7 @@ class AutoMapper:
         self.min_samples       = min_samples
         self.infer_empty       = infer_empty_slots
         self.gap_tolerance     = gap_tolerance
+        self.max_gap_mult      = max_gap_multiplier
 
         self._detections: list = []
         self._frame_count      = 0
@@ -158,17 +160,25 @@ class AutoMapper:
         inferred = {}
         seen_positions = set(map(tuple, centers.round(0).tolist()))
 
+        # Hard cap — any pair further apart than this is separated by a lane, not a slot
+        max_allowed_dist = max(med_w, med_h) * self.max_gap_mult
+
         for i in range(len(centers)):
             for j in range(i+1, len(centers)):
                 dx = centers[j][0] - centers[i][0]
                 dy = centers[j][1] - centers[i][1]
                 dist = np.hypot(dx, dy)
 
-                # Check if gap ≈ 2× slot width (horizontal) or 2× slot height (vertical)
-                # meaning exactly one slot is missing between them
+                # Reject immediately if too far apart — it's a drive lane gap
+                if dist > max_allowed_dist:
+                    continue
+
+                # Check if gap ≈ 2× slot width (H) or 2× slot height (V)
+                # meaning exactly one slot is missing between them.
+                # gap_tolerance=0.20 means dist must be within 20% of expected.
                 for expected, dim_w, dim_h, direction in [
-                    (med_w * 2,  med_w, med_h, "H"),
-                    (med_h * 2,  med_w, med_h, "V"),
+                    (med_w * 2, med_w, med_h, "H"),
+                    (med_h * 2, med_w, med_h, "V"),
                 ]:
                     tol = expected * self.gap_tolerance
                     if abs(dist - expected) < tol:
