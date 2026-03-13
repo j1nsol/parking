@@ -72,16 +72,16 @@ class AutoMapper:
     def __init__(
         self,
         slot_config_path: str = "slot_config.json",
-        min_detections_to_map: int = 50,
+        min_frames_to_map: int = 150,   # Fix #1: was min_detections_to_map=50, callers pass min_frames_to_map=150
         eps_pixels: int = 60,
         min_samples: int = 5,
         infer_empty_slots: bool = True,
         row_merge_tolerance: float = 0.6,
-        gap_tolerance: float = 0.22,
-        max_gap_multiplier: float = 2.3,
+        gap_tolerance: float = 0.22,    # NOTE #11: gap-fill math assumes equal slot spacing;
+        max_gap_multiplier: float = 2.3, # unequally-spaced lots may miss some inferred slots.
     ):
         self.config_path    = slot_config_path
-        self.min_detections = min_detections_to_map
+        self.min_detections = min_frames_to_map
         self.eps            = eps_pixels
         self.min_samples    = min_samples
         self.infer_empty    = infer_empty_slots

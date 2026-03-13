@@ -123,6 +123,12 @@ class ParkingDetector:
     # ------------------------------------------------------------------
     # Occupancy logic
     # ------------------------------------------------------------------
+    @staticmethod
+    def _is_quad(coords) -> bool:
+        """True if coords is a list of 4 [x,y] points (quad)."""
+        return (isinstance(coords, list) and len(coords) == 4
+                and isinstance(coords[0], (list, tuple)))
+
     def compute_occupancy(
         self,
         vehicle_boxes: list[list[float]],
@@ -132,30 +138,46 @@ class ParkingDetector:
         """
         Compare detected vehicles against known parking slots.
 
+        Supports both quad [[x,y]×4] coords (from auto_mapper) and
+        legacy rect [x1,y1,x2,y2] coords. Fix #4: previously assumed
+        only rect coords which would crash on quad slot configs.
+
         Args:
             vehicle_boxes: Output of detect_vehicles().
-            slots: Dict mapping slot_id -> {"coords": [x1,y1,x2,y2]}.
-            iou_threshold: Overlap fraction to consider a slot occupied.
+            slots: Dict mapping slot_id -> {"coords": quad_or_rect}.
+            iou_threshold: Overlap fraction for legacy rect slots.
 
         Returns:
             Dict mapping slot_id -> "Occupied" | "Vacant"
         """
+        import numpy as np
+
         statuses = {}
         for slot_id, slot_data in slots.items():
-            sx1, sy1, sx2, sy2 = slot_data["coords"]
-            slot_area = max(1, (sx2 - sx1) * (sy2 - sy1))
+            coords   = slot_data["coords"]
             occupied = False
 
             for vbox in vehicle_boxes:
                 vx1, vy1, vx2, vy2 = vbox
-                ix1 = max(sx1, vx1)
-                iy1 = max(sy1, vy1)
-                ix2 = min(sx2, vx2)
-                iy2 = min(sy2, vy2)
-                inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
-                if inter / slot_area >= iou_threshold:
-                    occupied = True
-                    break
+                cx = (vx1 + vx2) / 2
+                cy = (vy1 + vy2) / 2
+
+                if self._is_quad(coords):
+                    # Point-in-polygon test using vehicle centre
+                    contour = np.array(coords, dtype=np.float32)
+                    if cv2.pointPolygonTest(contour, (float(cx), float(cy)), False) >= 0:
+                        occupied = True
+                        break
+                else:
+                    # Legacy rect IoU
+                    sx1, sy1, sx2, sy2 = coords
+                    slot_area = max(1, (sx2 - sx1) * (sy2 - sy1))
+                    ix1 = max(sx1, vx1);  iy1 = max(sy1, vy1)
+                    ix2 = min(sx2, vx2);  iy2 = min(sy2, vy2)
+                    inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+                    if inter / slot_area >= iou_threshold:
+                        occupied = True
+                        break
 
             statuses[slot_id] = "Occupied" if occupied else "Vacant"
         return statuses

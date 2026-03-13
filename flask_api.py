@@ -64,16 +64,18 @@ log.info("Model ready.")
 
 # ── Shared state — protected by _state_lock ───────────────────────────────────
 # Using RLock so the bg thread can acquire it re-entrantly if needed.
-_state_lock      = threading.RLock()
-_latest_frame    = None          # Last annotated JPEG bytes (ready to serve)
-_latest_raw_frame = None         # Last raw frame (numpy array) for preview endpoint
-_latest_statuses = {}            # slot_id -> "Occupied" | "Vacant"
-_slots           = {}            # slot_id -> {coords, row, ...}
-_smoothing_hist  = {}            # slot_id -> deque for temporal smoothing
-_mapping_phase   = True          # True while auto-mapper is still running
-_frame_count     = 0
-_last_fb_push    = 0             # epoch ms of last Firebase push
-_remap_requested = False         # Set by /remap route, consumed by bg thread
+_state_lock       = threading.RLock()
+_latest_frame     = None          # Last annotated JPEG bytes (kept for /live-frame fallback)
+_latest_raw_frame = None          # Last raw numpy frame (for undistort preview)
+_latest_statuses  = {}            # slot_id -> "Occupied" | "Vacant"
+_latest_vehicle_boxes = []        # last YOLO detections — read by stream thread
+_latest_slot_results  = []        # last slot occupancy results — read by stream thread
+_slots            = {}            # slot_id -> {coords, row, ...}
+_smoothing_hist   = {}            # slot_id -> deque for temporal smoothing
+_mapping_phase    = True          # True while auto-mapper is still running
+_frame_count      = 0
+_last_fb_push     = 0
+_remap_requested  = False
 
 # ── Shared undistort state — hot-reloaded from Firebase ──────────────────────
 _undistort_cfg = {
@@ -241,7 +243,7 @@ def _detection_loop():
     Owns: camera, YOLO inference, auto-mapper, Firebase sync, smoothing.
     Writes results into shared state for Flask routes to read.
     """
-    global _latest_frame, _latest_raw_frame, _latest_statuses, _slots, _mapping_phase, _frame_count, _last_fb_push, firebase_instance, _remap_requested
+    global _latest_frame, _latest_raw_frame, _latest_statuses, _latest_vehicle_boxes, _latest_slot_results, _slots, _mapping_phase, _frame_count, _last_fb_push, firebase_instance, _remap_requested
 
     # ── Firebase ──────────────────────────────────────────────────────────────
     firebase = None
@@ -452,16 +454,16 @@ def _detection_loop():
 
             statuses = _apply_smoothing(statuses)
 
-            # Annotate frame and encode to JPEG
-            annotated = _draw_boxes(frame.copy(), vehicle_boxes, slot_results)
-            frame_small = cv2.resize(annotated, (1280, 720))
-            _, buf = cv2.imencode(".jpg", frame_small, [cv2.IMWRITE_JPEG_QUALITY, 70])
+            # Update slot statuses with smoothed values
+            for sr in slot_results:
+                sr["status"] = statuses[sr["id"]]
 
-            # Write shared state
+            # Write shared state — stream thread handles frame annotation + encoding
             with _state_lock:
-                _latest_frame    = buf.tobytes()
-                _latest_statuses = dict(statuses)
-                _frame_count     = local_frame_count
+                _latest_vehicle_boxes = list(vehicle_boxes)
+                _latest_slot_results  = list(slot_results)
+                _latest_statuses      = dict(statuses)
+                _frame_count          = local_frame_count
 
             # Firebase push every firebase_every cycles
             if firebase and local_frame_count % max(1, firebase_every) == 0:
@@ -484,10 +486,134 @@ def _detection_loop():
             time.sleep(2)
 
 
-# ── Start background thread on import ────────────────────────────────────────
+# ── MJPEG stream loop ─────────────────────────────────────────────────────────
+# Runs at ~15 FPS independently of YOLO. Grabs raw frames, draws the latest
+# YOLO overlay (vehicle boxes + slot results), encodes to JPEG and pushes into
+# a queue that the /stream endpoint reads from.
+
+import queue as _queue
+
+STREAM_FPS      = 15          # target display FPS
+STREAM_QUALITY  = 60          # JPEG quality (lower = faster transfer)
+STREAM_WIDTH    = 1280
+STREAM_HEIGHT   = 720
+_stream_queue   = _queue.Queue(maxsize=2)   # bounded — drops stale frames
+_stream_clients = 0                         # count of active /stream connections
+_stream_lock    = threading.Lock()
+
+
+def _stream_loop():
+    """
+    Dedicated thread: grabs frames fast, overlays latest YOLO results,
+    pushes annotated JPEGs to _stream_queue for MJPEG clients.
+    Only runs when at least one browser tab has the stream open.
+    """
+    global _stream_clients
+    cap = None
+    interval = 1.0 / STREAM_FPS
+
+    # Fix #3: cache the undistorter — only rebuild when config actually changes
+    _cached_udist      = None
+    _cached_udist_cfg  = {}
+
+    def open_cap():
+        c = cv2.VideoCapture(RTSP_URL, cv2.CAP_FFMPEG)
+        c.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        return c
+
+    while True:
+        # If no clients, sleep and release camera to save resources
+        with _stream_lock:
+            clients = _stream_clients
+        if clients == 0:
+            if cap and cap.isOpened():
+                cap.release()
+                cap = None
+                log.info("[STREAM] No clients — camera released.")
+            time.sleep(0.5)
+            continue
+
+        # Open camera if needed
+        if cap is None or not cap.isOpened():
+            log.info("[STREAM] Client connected — opening stream camera.")
+            cap = open_cap()
+
+        t0 = time.time()
+
+        # Drain buffer then grab freshest frame
+        cap.grab(); cap.grab()
+        ret, frame = cap.retrieve()
+        if not ret or frame is None:
+            cap.release()
+            cap = open_cap()
+            time.sleep(0.1)
+            continue
+
+        # Apply undistortion if enabled — rebuild only when config changes
+        with _state_lock:
+            udist_cfg = dict(_undistort_cfg)
+        if udist_cfg.get("enabled"):
+            if udist_cfg != _cached_udist_cfg:
+                try:
+                    from undistort import WideAngleUndistorter
+                    _cached_udist     = WideAngleUndistorter(
+                        k1=udist_cfg["k1"], k2=udist_cfg["k2"], alpha=udist_cfg["alpha"]
+                    )
+                    _cached_udist_cfg = dict(udist_cfg)
+                    log.info("[STREAM] Undistorter rebuilt with new config.")
+                except Exception:
+                    _cached_udist = None
+            if _cached_udist is not None:
+                try:
+                    frame = _cached_udist.process(frame)
+                except Exception:
+                    pass
+        else:
+            # Distortion disabled — clear cached instance
+            if _cached_udist is not None:
+                _cached_udist     = None
+                _cached_udist_cfg = {}
+
+        # Read latest YOLO overlay (no lock held during draw — just stale data is fine)
+        with _state_lock:
+            vboxes      = list(_latest_vehicle_boxes)
+            slot_res    = list(_latest_slot_results)
+            mapping     = _mapping_phase
+
+        # Draw overlay
+        annotated = _draw_boxes(frame, vboxes, slot_res if not mapping else None)
+        if mapping:
+            cv2.putText(annotated, "Auto-mapping in progress...",
+                        (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 200, 0), 2)
+
+        # Resize + encode
+        small = cv2.resize(annotated, (STREAM_WIDTH, STREAM_HEIGHT))
+        _, buf = cv2.imencode(".jpg", small, [cv2.IMWRITE_JPEG_QUALITY, STREAM_QUALITY])
+
+        # Push to queue — discard oldest frame if full (client is slow)
+        try:
+            _stream_queue.put_nowait(buf.tobytes())
+        except _queue.Full:
+            try:
+                _stream_queue.get_nowait()
+                _stream_queue.put_nowait(buf.tobytes())
+            except _queue.Empty:
+                pass
+
+        # Pace to target FPS
+        elapsed = time.time() - t0
+        sleep_t = max(0, interval - elapsed)
+        time.sleep(sleep_t)
+
+
+# ── Start background threads on import ───────────────────────────────────────
 _bg_thread = threading.Thread(target=_detection_loop, name="detection-loop", daemon=True)
 _bg_thread.start()
 log.info("[MAIN] Background detection thread started.")
+
+_stream_thread = threading.Thread(target=_stream_loop, name="stream-loop", daemon=True)
+_stream_thread.start()
+log.info("[MAIN] MJPEG stream thread started.")
 
 
 # ── Flask Routes ──────────────────────────────────────────────────────────────
@@ -531,29 +657,72 @@ def get_occupancy():
     })
 
 
+@app.route("/stream")
+def mjpeg_stream():
+    """
+    MJPEG stream endpoint — browser points an <img> tag here.
+    Pushes annotated frames at ~15 FPS continuously.
+    Decoupled from YOLO: boxes are from last inference, frames are always fresh.
+    """
+    global _stream_clients
+
+    def generate():
+        global _stream_clients
+        with _stream_lock:
+            _stream_clients += 1
+        log.info(f"[STREAM] Client connected. Total: {_stream_clients}")
+        try:
+            while True:
+                try:
+                    frame_bytes = _stream_queue.get(timeout=3.0)
+                except _queue.Empty:
+                    # Send a placeholder if stream stalls
+                    placeholder = np.zeros((STREAM_HEIGHT, STREAM_WIDTH, 3), dtype=np.uint8)
+                    cv2.putText(placeholder, "Waiting for camera...",
+                                (300, 360), cv2.FONT_HERSHEY_SIMPLEX, 1, (80,80,80), 2)
+                    _, buf = cv2.imencode(".jpg", placeholder)
+                    frame_bytes = buf.tobytes()
+
+                yield (b"--frame\r\n"
+                       b"Content-Type: image/jpeg\r\n\r\n"
+                       + frame_bytes + b"\r\n")
+        finally:
+            with _stream_lock:
+                _stream_clients -= 1
+            log.info(f"[STREAM] Client disconnected. Total: {_stream_clients}")
+
+    return Response(
+        generate(),
+        mimetype="multipart/x-mixed-replace; boundary=frame",
+        headers={"Cache-Control": "no-cache, no-store, must-revalidate",
+                 "X-Accel-Buffering": "no"},
+    )
+
+
 @app.route("/live-frame", methods=["GET"])
 def live_frame():
     """
-    Returns the latest annotated JPEG produced by the background thread.
-    No YOLO inference here — just serves the pre-computed frame instantly.
-    Web app polls this every ~1.5s.
+    Legacy single-frame endpoint — kept for /undistort-preview and image test.
+    For live display use /stream instead.
     """
     with _state_lock:
-        frame_bytes = _latest_frame
+        raw = _latest_raw_frame.copy() if _latest_raw_frame is not None else None
+        vboxes   = list(_latest_vehicle_boxes)
+        slot_res = list(_latest_slot_results)
 
-    if frame_bytes is None:
-        # Bg thread hasn't produced a frame yet — return placeholder
+    if raw is None:
         placeholder = np.zeros((720, 1280, 3), dtype=np.uint8)
         cv2.putText(placeholder, "Initialising camera — please wait...",
                     (200, 360), cv2.FONT_HERSHEY_SIMPLEX, 1, (80, 80, 80), 2)
         _, buf = cv2.imencode(".jpg", placeholder)
-        frame_bytes = buf.tobytes()
+        return Response(buf.tobytes(), mimetype="image/jpeg",
+                        headers={"Cache-Control": "no-cache"})
 
-    return Response(
-        frame_bytes,
-        mimetype="image/jpeg",
-        headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
-    )
+    annotated   = _draw_boxes(raw, vboxes, slot_res)
+    frame_small = cv2.resize(annotated, (1280, 720))
+    _, buf      = cv2.imencode(".jpg", frame_small, [cv2.IMWRITE_JPEG_QUALITY, 70])
+    return Response(buf.tobytes(), mimetype="image/jpeg",
+                    headers={"Cache-Control": "no-cache, no-store, must-revalidate"})
 
 
 @app.route("/analyze-image", methods=["POST"])
@@ -907,10 +1076,10 @@ def trigger_remap():
     Admin endpoint — signals the bg thread to reset the AutoMapper object
     and restart the mapping phase.
     """
-    global _remap_requested
+    global _remap_requested, _smoothing_hist
     with _state_lock:
         _remap_requested = True
-        _smoothing_hist  = {}
+        _smoothing_hist.clear()   # Fix #2: was assigning a local; .clear() mutates the real global
     if os.path.exists(SLOT_CONFIG):
         os.remove(SLOT_CONFIG)
     log.info("[ADMIN] Remap requested — bg thread will reset mapper on next frame.")

@@ -1,6 +1,14 @@
 """
 main.py — AI-Powered Smart Parking System
 Main entry point — runs on Raspberry Pi 5
+
+⚠️  DEPRECATED — Fix #5: flask_api.py is the unified entry point and includes
+the full detection loop, MJPEG stream, slot editor API, distortion panel, and
+Firebase sync. You should run:
+    python3 flask_api.py
+instead of this file.
+
+This file is kept only as a reference / fallback for headless (no-API) use.
 """
 
 import time
@@ -37,7 +45,7 @@ def main():
     # 2. Initialize auto-mapper
     mapper = AutoMapper(
         slot_config_path="slot_config.json",
-        min_frames_to_map=150,
+        min_frames_to_map=150,   # Fix #1/#5: parameter was misnamed min_frames_to_map before
         min_samples=3,
     )
 
