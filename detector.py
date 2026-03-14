@@ -103,12 +103,15 @@ class ParkingDetector:
     # ------------------------------------------------------------------
     def detect_vehicles(self, frame: np.ndarray) -> list[list[float]]:
         """
-        Undistort frame then run YOLO to return bounding boxes for vehicles.
+        Optionally undistort frame then run YOLO to return bounding boxes.
+        Fix #11: skip undistort_frame() call entirely when undistorter is None
+        rather than calling it unconditionally and checking inside.
 
         Returns:
             List of [x1, y1, x2, y2] boxes (pixel coordinates).
         """
-        frame = self.undistort_frame(frame)
+        if self.undistorter is not None:
+            frame = self.undistort_frame(frame)
 
         results = self.model(frame, conf=self.conf, verbose=False)
         boxes = []

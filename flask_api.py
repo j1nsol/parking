@@ -72,8 +72,11 @@ os.environ["OPENCV_LOG_LEVEL"]        = "ERROR"
 os.environ["OPENCV_FFMPEG_LOGLEVEL"]  = "8"   # AV_LOG_FATAL only
 
 # ── Load YOLO once — shared by bg thread and /analyze-image ──────────────────
+# Fix #1: YOLO inference is NOT thread-safe. Guard every model() call with
+# this lock so the bg detection thread and /analyze-image never run together.
 log.info("Loading YOLOv8n model...")
-model = YOLO("yolov8n.pt")
+model      = YOLO("yolov8n.pt")
+_yolo_lock = threading.Lock()
 log.info("Model ready.")
 
 # ── Shared state — protected by _state_lock ───────────────────────────────────
@@ -424,12 +427,14 @@ def _detection_loop():
                             _undistort_cfg.update(active_cfg)
                 except Exception as e:
                     log.warning(f"[BG] Undistort config poll failed: {e}")
-                # Program config
+                # Program config — compare outside lock, only acquire to write
                 try:
                     new_prog = firebase.get_program_config()
                     with _state_lock:
-                        if new_prog != _prog_cfg:
-                            log.info(f"[BG] Program config changed: {new_prog}")
+                        current_prog = dict(_prog_cfg)
+                    if new_prog != current_prog:   # Fix #4: comparison now outside lock
+                        log.info(f"[BG] Program config changed: {new_prog}")
+                        with _state_lock:
                             _prog_cfg.update(new_prog)
                 except Exception as e:
                     log.warning(f"[BG] Program config poll failed: {e}")
@@ -457,7 +462,8 @@ def _detection_loop():
 
             # ── Run YOLO (or reuse last result if skipping this frame) ─────────
             if local_frame_count % max(1, yolo_every_n) == 0:
-                results = model(frame, conf=conf, classes=TARGET_CLASSES, verbose=False)
+                with _yolo_lock:   # Fix #1: prevent race with /analyze-image
+                    results = model(frame, conf=conf, classes=TARGET_CLASSES, verbose=False)
                 vehicle_boxes = []
                 for r in results:
                     for box in r.boxes:
@@ -712,10 +718,10 @@ def status():
         slots_loaded = len(_slots)
         mapping      = _mapping_phase
         frame_count  = _frame_count
-        cam_ok       = _latest_frame is not None or mapping
+        cam_ok       = _latest_raw_frame is not None   # Fix #3: was always True during mapping
     return jsonify({
         "online":        True,
-        "camera":        cam_ok,
+        "camera":        cam_ok,   # Fix #3: now True only when a real frame exists
         "slots_loaded":  slots_loaded,
         "mapping_phase": mapping,
         "frame_count":   frame_count,
@@ -827,7 +833,10 @@ def analyze_image():
         return jsonify({"error": "Could not decode image"}), 400
 
     h, w = frame.shape[:2]
-    results = model(frame, conf=CONFIDENCE, classes=TARGET_CLASSES, verbose=False)
+    with _state_lock:
+        live_conf = _prog_cfg["confidence"]   # Fix #10: use live admin-set confidence
+    with _yolo_lock:                          # Fix #1: guard shared model
+        results = model(frame, conf=live_conf, classes=TARGET_CLASSES, verbose=False)
     vehicle_boxes = []
     for r in results:
         for box in r.boxes:
@@ -863,17 +872,21 @@ def analyze_image():
     occupied_count = 0
     for slot_id, slot_data in current_slots.items():
         coords = slot_data["coords"]
-        is_occ = any(_check_overlap(vb["coords"], coords) for vb in vehicle_boxes)
-        conf   = next(
-            (vb["confidence"] for vb in vehicle_boxes if _check_overlap(vb["coords"], coords)),
-            0.0,
+        # Fix #2: single pass — find the first overlapping vehicle box (if any)
+        # previously _check_overlap was called twice per slot (once for is_occ,
+        # once again inside next() for confidence) — wasteful point-in-polygon work.
+        matched_vb = next(
+            (vb for vb in vehicle_boxes if _check_overlap(vb["coords"], coords)),
+            None,
         )
+        is_occ = matched_vb is not None
+        conf   = matched_vb["confidence"] if is_occ else round(0.88 + (hash(slot_id) % 10) * 0.01, 3)
         if is_occ:
             occupied_count += 1
         slot_results.append({
             "id":         slot_id,
             "status":     "Occupied" if is_occ else "Vacant",
-            "confidence": round(conf, 3) if is_occ else round(0.88 + (hash(slot_id) % 10) * 0.01, 3),
+            "confidence": round(conf, 3),
             "row":        slot_data.get("row", "A"),
             "coords":     coords,
         })
@@ -1173,6 +1186,41 @@ def trigger_remap():
         os.remove(SLOT_CONFIG)
     log.info("[ADMIN] Remap requested — bg thread will reset mapper on next frame.")
     return jsonify({"status": "remap_started", "message": "Auto-mapping restarted."})
+
+
+@app.route("/slots", methods=["POST"])
+def add_slot():
+    """
+    Admin endpoint — add a brand-new slot with a given quad.
+    Fix #7: previously there was no way to add a slot the automapper missed
+    without hand-editing slot_config.json on the Pi.
+    Body: { "slot_id": "S99", "coords": [[x,y],[x,y],[x,y],[x,y]], "row": "A" }
+    """
+    global _slots
+    data     = request.get_json(silent=True) or {}
+    slot_id  = data.get("slot_id", "").strip()
+    coords   = data.get("coords")
+    row      = data.get("row", "A")
+
+    if not slot_id:
+        return jsonify({"error": "slot_id is required"}), 400
+    if not coords or len(coords) != 4:
+        return jsonify({"error": "coords must be a list of 4 [x,y] points"}), 400
+
+    with _state_lock:
+        if slot_id in _slots:
+            return jsonify({"error": f"Slot {slot_id} already exists — use PUT to update"}), 409
+        _slots[slot_id] = {"coords": coords, "row": row, "source": "manual"}
+        current = dict(_slots)
+
+    with open(SLOT_CONFIG, "w") as f:
+        json.dump(current, f, indent=2)
+
+    if firebase_instance:
+        firebase_instance.push_slot_layout(current)
+
+    log.info(f"[ADMIN] Slot {slot_id} added manually at row={row}.")
+    return jsonify({"status": "ok", "slot_id": slot_id, "coords": coords, "row": row}), 201
 
 
 @app.route("/slots/<slot_id>", methods=["PUT"])

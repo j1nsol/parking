@@ -187,7 +187,8 @@ class AutoMapper:
                      f"angle={rect[2]:.1f}° size={round(rect[1][0])}×{round(rect[1][1])}")
 
         if self.infer_empty and len(cluster_data) >= 2:
-            inferred = self._infer_by_row(cluster_data, frame_shape, len(slots))
+            # Fix #8: pass existing slot IDs so inferred names never collide
+            inferred = self._infer_by_row(cluster_data, frame_shape, set(slots.keys()))
             slots.update(inferred)
             if inferred:
                 log.info(f"Row inference added {len(inferred)} empty slot(s).")
@@ -196,12 +197,23 @@ class AutoMapper:
         self._save_config()
 
     # ------------------------------------------------------------------
-    def _infer_by_row(self, cluster_data, frame_shape, next_index):
+    def _infer_by_row(self, cluster_data, frame_shape, existing_ids: set):
         """
-        Group quads into rows by Y proximity, then fill single-slot gaps
-        within each row. Inferred slots inherit the average quad shape
-        of their two neighbors, rotated to match.
+        Group quads into rows by Y proximity, then fill gaps within each row.
+        Fix #8: accepts existing_ids set so generated names never collide.
+        Fix #9: fills both single AND double slot gaps (not just single).
+        Inferred slots inherit the averaged quad shape of their neighbors.
         """
+        # Build a collision-safe ID generator
+        used_ids  = set(existing_ids)
+        counter   = [1]
+        def _next_id():
+            while True:
+                candidate = f"S{counter[0]:02d}"
+                counter[0] += 1
+                if candidate not in used_ids:
+                    used_ids.add(candidate)
+                    return candidate
         # Estimate median slot diagonal for scale reference
         diagonals = []
         for _, _, quad in cluster_data:
@@ -246,37 +258,49 @@ class AutoMapper:
 
                 expected = med_diag * 1.1
                 tol      = expected * self.gap_tolerance
-                if abs(dist - expected * 2) >= tol * 2:
+
+                # Fix #9: detect both single-slot gaps (2× slot width) and
+                # double-slot gaps (3× slot width) between detected clusters.
+                # For each gap size, insert the correct number of inferred slots.
+                gap_slots = None
+                if abs(dist - expected * 2) < tol * 2:
+                    gap_slots = 1   # one slot missing between a and b
+                elif abs(dist - expected * 3) < tol * 3:
+                    gap_slots = 2   # two slots missing between a and b
+
+                if gap_slots is None:
                     continue
 
-                mid_cx = (cx_a + cx_b) / 2
-                mid_cy = (cy_a + cy_b) / 2
+                # Insert gap_slots evenly-spaced inferred slots between a and b
+                for gap_i in range(1, gap_slots + 1):
+                    frac   = gap_i / (gap_slots + 1)
+                    mid_cx = cx_a + frac * (cx_b - cx_a)
+                    mid_cy = cy_a + frac * (cy_b - cy_a)
 
-                if any(np.hypot(mid_cx-sx, mid_cy-sy) < med_diag*0.4 for sx,sy in seen):
-                    continue
+                    if any(np.hypot(mid_cx-sx, mid_cy-sy) < med_diag*0.4 for sx,sy in seen):
+                        continue
 
-                # Build inferred quad by averaging the two neighbor quads
-                # and translating to the midpoint
-                avg_quad = []
-                for pi in range(4):
-                    ax = (quad_a[pi][0] + quad_b[pi][0]) / 2
-                    ay = (quad_a[pi][1] + quad_b[pi][1]) / 2
-                    avg_quad.append([ax, ay])
+                    # Interpolate quad between the two neighbors
+                    avg_quad = []
+                    for pi in range(4):
+                        ax = quad_a[pi][0] + frac * (quad_b[pi][0] - quad_a[pi][0])
+                        ay = quad_a[pi][1] + frac * (quad_b[pi][1] - quad_a[pi][1])
+                        avg_quad.append([ax, ay])
 
-                # Translate averaged quad so its center sits at mid_cx, mid_cy
-                avg_cx, avg_cy = quad_center(avg_quad)
-                dx, dy = mid_cx - avg_cx, mid_cy - avg_cy
-                final_quad = [[round(p[0]+dx), round(p[1]+dy)] for p in avg_quad]
+                    # Translate so quad center sits exactly at mid_cx, mid_cy
+                    avg_cx, avg_cy = quad_center(avg_quad)
+                    dx, dy = mid_cx - avg_cx, mid_cy - avg_cy
+                    final_quad = [[round(p[0]+dx), round(p[1]+dy)] for p in avg_quad]
 
-                sid = f"S{next_index+1:02d}"
-                next_index += 1
-                inferred[sid] = {
-                    "coords": final_quad,
-                    "row":    self._infer_row(mid_cy, frame_shape[0]),
-                    "source": "inferred",
-                }
-                seen.append((mid_cx, mid_cy))
-                log.info(f"  → Inferred {sid} at ({round(mid_cx)},{round(mid_cy)}) row={row_idx}")
+                    sid = _next_id()   # Fix #8: collision-safe ID
+                    inferred[sid] = {
+                        "coords": final_quad,
+                        "row":    self._infer_row(mid_cy, frame_shape[0]),
+                        "source": "inferred",
+                    }
+                    seen.append((mid_cx, mid_cy))
+                    log.info(f"  → Inferred {sid} at ({round(mid_cx)},{round(mid_cy)}) "
+                             f"gap={gap_slots} frac={frac:.2f}")
 
         return inferred
 
