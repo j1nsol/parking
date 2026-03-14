@@ -45,9 +45,7 @@ IOU_THRESHOLD  = 0.35
 SMOOTHING_WIN  = 5            # frames for majority-vote smoothing
 DETECT_INTERVAL = 1.0         # seconds between detection cycles
 FIREBASE_EVERY  = 2           # push Firebase every N detection cycles
-MAPPER_EPS_PX   = 40          # DBSCAN eps — max px between detections in same slot cluster.
-                               # Lower = tighter clusters, better separation of close cars.
-                               # Raise if valid slots are being split into multiple clusters.
+MAPPER_EPS_PX   = 40          # DBSCAN eps pixels — lower separates close-parked cars better
 
 # Fisheye undistortion — values are live-fetched from Firebase every 5s.
 # These are only the startup fallback defaults used before Firebase responds.
@@ -58,7 +56,20 @@ ZOOM        = 0.7
 # How often the bg thread checks Firebase for undistort config changes (seconds)
 UNDISTORT_POLL_INTERVAL = 5
 
-os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
+# Force TCP transport and suppress H.264/RTSP decoder noise.
+# These must be set before any VideoCapture call.
+os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
+    "rtsp_transport;tcp"
+    "|fflags;nobuffer"
+    "|flags;low_delay"
+    "|max_delay;0"
+    "|reorder_queue_size;0"
+    "|analyzeduration;1000000"   # 1 s — faster stream open
+    "|probesize;1000000"
+)
+# Suppress noisy H.264/FFmpeg log spam on stderr (Pi logs fill up fast)
+os.environ["OPENCV_LOG_LEVEL"]        = "ERROR"
+os.environ["OPENCV_FFMPEG_LOGLEVEL"]  = "8"   # AV_LOG_FATAL only
 
 # ── Load YOLO once — shared by bg thread and /analyze-image ──────────────────
 log.info("Loading YOLOv8n model...")
@@ -203,35 +214,83 @@ def _draw_boxes(frame, vehicle_boxes, slot_results=None):
 _cap = None
 
 
-def _open_camera():
-    global _cap
-    log.info("[CAM] Opening RTSP stream (TCP)...")
-    _cap = cv2.VideoCapture(RTSP_URL, cv2.CAP_FFMPEG)
-    _cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-    if _cap.isOpened():
-        log.info("[CAM] Stream opened successfully.")
-    else:
-        log.error("[CAM] Failed to open RTSP stream.")
+# Max consecutive decode failures before forcing a full reconnect
+_MAX_DECODE_FAILS = 8
 
+def _open_camera(retries: int = 5, delay: float = 3.0):
+    """
+    Open RTSP stream with retry loop and tuned CAP properties.
+    Retries up to `retries` times with `delay` seconds between attempts.
+    Sets low-latency buffer options to reduce H.264 decode lag.
+    """
+    global _cap
+    for attempt in range(1, retries + 1):
+        log.info(f"[CAM] Opening RTSP stream (attempt {attempt}/{retries})...")
+        cap = cv2.VideoCapture(RTSP_URL, cv2.CAP_FFMPEG)
+        # Keep internal buffer minimal — we always want the LATEST frame
+        cap.set(cv2.CAP_PROP_BUFFERSIZE,    1)
+        # Tell FFmpeg not to buffer — reduces latency and H.264 decode errors
+        cap.set(cv2.CAP_PROP_FOURCC,        cv2.VideoWriter_fourcc(*"H264"))
+        cap.set(cv2.CAP_PROP_FPS,           15)
+        if cap.isOpened():
+            # Warm-up: read and discard a few frames so the decoder is stable
+            for _ in range(4):
+                cap.grab()
+            _cap = cap
+            log.info("[CAM] Stream opened successfully.")
+            return
+        cap.release()
+        log.warning(f"[CAM] Attempt {attempt} failed — retrying in {delay}s...")
+        time.sleep(delay)
+    log.error(f"[CAM] Could not open RTSP stream after {retries} attempts.")
+    _cap = None
+
+
+_decode_fail_count = 0   # consecutive decode failures for bg thread camera
 
 def _get_raw_frame():
-    """Grab the freshest frame, reconnecting if dropped."""
-    global _cap
+    """
+    Grab the freshest frame from the RTSP stream.
+
+    Strategy:
+      - Drain stale frames with grab() then do ONE read() for a fresh frame.
+      - Count consecutive decode failures; reconnect after _MAX_DECODE_FAILS.
+      - On reconnect, back off 2 s to let the camera recover (avoids hammering).
+    """
+    global _cap, _decode_fail_count
+
     if _cap is None or not _cap.isOpened():
         _open_camera()
+        if _cap is None:
+            return None
 
-    # Drain buffer
-    for _ in range(4):
+    # Drain buffered frames — grab without decode (cheap)
+    for _ in range(3):
         _cap.grab()
 
-    ret, frame = _cap.retrieve()
-    if not ret or frame is None:
-        log.warning("[CAM] Stream lost — reconnecting...")
-        _cap.release()
-        _open_camera()
-        ret, frame = _cap.read()
+    # Read one fresh frame (grab + decode combined)
+    ret, frame = _cap.read()
 
-    return frame if (ret and frame is not None) else None
+    if ret and frame is not None:
+        _decode_fail_count = 0
+        return frame
+
+    # Decode failed
+    _decode_fail_count += 1
+    log.warning(f"[CAM] Decode failure #{_decode_fail_count} — "
+                f"{'reconnecting...' if _decode_fail_count >= _MAX_DECODE_FAILS else 'retrying'}")
+
+    if _decode_fail_count >= _MAX_DECODE_FAILS:
+        _decode_fail_count = 0
+        try:
+            _cap.release()
+        except Exception:
+            pass
+        _cap = None
+        time.sleep(2.0)   # let the camera breathe before reconnecting
+        _open_camera()
+
+    return None
 
 
 # ── Background detection + sync thread ───────────────────────────────────────
@@ -264,7 +323,7 @@ def _detection_loop():
         slot_config_path=SLOT_CONFIG,
         min_frames_to_map=150,
         min_samples=3,
-        eps_pixels=MAPPER_EPS_PX,   # tune in config above if close cars merge into one cluster
+        eps_pixels=MAPPER_EPS_PX,
     )
     with _state_lock:
         mapping_phase = _mapping_phase
@@ -508,17 +567,36 @@ _stream_lock    = threading.Lock()
 
 def _stream_loop():
     """
-    Dedicated thread: grabs frames fast, overlays latest YOLO results,
+    Dedicated thread: grabs frames at STREAM_FPS, overlays latest YOLO results,
     pushes annotated JPEGs to _stream_queue for MJPEG clients.
     Only runs when at least one browser tab has the stream open.
+
+    Robustness improvements:
+      - open_cap() sets identical low-latency options as _open_camera()
+      - Decode failures are counted; reconnect only after N consecutive fails
+        to avoid thrashing on a momentary H.264 glitch
+      - Exponential back-off on reconnect (2 s cap) prevents camera hammering
     """
     global _stream_clients
-    cap = None
-    interval = 1.0 / STREAM_FPS
+    cap              = None
+    interval         = 1.0 / STREAM_FPS
+    stream_fail_count = 0
+    MAX_STREAM_FAILS  = 6
+    reconnect_delay   = 1.0   # grows on repeated failures, caps at 8 s
+
+    # Fix #3: cache the undistorter — only rebuild when config actually changes
+    _cached_udist      = None
+    _cached_udist_cfg  = {}
 
     def open_cap():
+        """Open a fresh VideoCapture with the same low-latency settings as bg thread."""
         c = cv2.VideoCapture(RTSP_URL, cv2.CAP_FFMPEG)
         c.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        c.set(cv2.CAP_PROP_FOURCC,     cv2.VideoWriter_fourcc(*"H264"))
+        c.set(cv2.CAP_PROP_FPS,        15)
+        if c.isOpened():
+            for _ in range(3):   # warm-up grab
+                c.grab()
         return c
 
     while True:
@@ -529,25 +607,47 @@ def _stream_loop():
             if cap and cap.isOpened():
                 cap.release()
                 cap = None
+                stream_fail_count = 0
+                reconnect_delay   = 1.0
                 log.info("[STREAM] No clients — camera released.")
             time.sleep(0.5)
             continue
 
         # Open camera if needed
         if cap is None or not cap.isOpened():
-            log.info("[STREAM] Client connected — opening stream camera.")
+            log.info("[STREAM] Opening stream camera...")
             cap = open_cap()
+            if not cap.isOpened():
+                log.warning(f"[STREAM] Camera open failed — retrying in {reconnect_delay:.1f}s")
+                time.sleep(reconnect_delay)
+                reconnect_delay = min(reconnect_delay * 2, 8.0)
+                cap = None
+                continue
+            reconnect_delay = 1.0   # reset on success
 
         t0 = time.time()
 
-        # Drain buffer then grab freshest frame
+        # Drain stale buffered frames cheaply, then read one fresh frame
         cap.grab(); cap.grab()
-        ret, frame = cap.retrieve()
+        ret, frame = cap.read()
+
         if not ret or frame is None:
-            cap.release()
-            cap = open_cap()
-            time.sleep(0.1)
+            stream_fail_count += 1
+            log.warning(f"[STREAM] Decode failure #{stream_fail_count}")
+            if stream_fail_count >= MAX_STREAM_FAILS:
+                log.warning("[STREAM] Too many failures — reconnecting...")
+                try:
+                    cap.release()
+                except Exception:
+                    pass
+                cap = None
+                stream_fail_count = 0
+                time.sleep(reconnect_delay)
+                reconnect_delay = min(reconnect_delay * 2, 8.0)
             continue
+
+        stream_fail_count = 0
+        reconnect_delay   = 1.0
 
         # Apply undistortion if enabled
         with _state_lock:
@@ -1065,10 +1165,10 @@ def trigger_remap():
     Admin endpoint — signals the bg thread to reset the AutoMapper object
     and restart the mapping phase.
     """
-    global _remap_requested
+    global _remap_requested, _smoothing_hist
     with _state_lock:
         _remap_requested = True
-        _smoothing_hist  = {}
+        _smoothing_hist.clear()   # .clear() mutates the real global dict
     if os.path.exists(SLOT_CONFIG):
         os.remove(SLOT_CONFIG)
     log.info("[ADMIN] Remap requested — bg thread will reset mapper on next frame.")

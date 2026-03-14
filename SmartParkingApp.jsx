@@ -643,4 +643,3 @@ export default function App(){
     </div>
   );
 }
-python3 main.py
