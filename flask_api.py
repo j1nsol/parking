@@ -93,6 +93,8 @@ _mapping_phase    = True          # True while auto-mapper is still running
 _frame_count      = 0
 _last_fb_push     = 0
 _remap_requested  = False
+_remap_layout_mode = "auto"       # mode requested by the last /remap call —
+                                   # applied by the bg thread when it resets the mapper
 
 # ── Shared undistort state — hot-reloaded from Firebase ──────────────────────
 _undistort_cfg = {
@@ -308,7 +310,7 @@ def _detection_loop():
     Owns: camera, YOLO inference, auto-mapper, Firebase sync, smoothing.
     Writes results into shared state for Flask routes to read.
     """
-    global _latest_frame, _latest_raw_frame, _latest_statuses, _latest_vehicle_boxes, _latest_slot_results, _slots, _mapping_phase, _frame_count, _last_fb_push, firebase_instance, _remap_requested
+    global _latest_frame, _latest_raw_frame, _latest_statuses, _latest_vehicle_boxes, _latest_slot_results, _slots, _mapping_phase, _frame_count, _last_fb_push, firebase_instance, _remap_requested, _remap_layout_mode
 
     # ── Firebase ──────────────────────────────────────────────────────────────
     firebase = None
@@ -322,11 +324,14 @@ def _detection_loop():
         log.error(f"[FB] Firebase init failed — occupancy won't be synced: {e}")
 
     # ── Auto-mapper ───────────────────────────────────────────────────────────
+    with _state_lock:
+        initial_mode = _remap_layout_mode
     mapper = AutoMapper(
         slot_config_path=SLOT_CONFIG,
         min_frames_to_map=150,
         min_samples=3,
         eps_pixels=MAPPER_EPS_PX,
+        layout_mode=initial_mode,
     )
     with _state_lock:
         mapping_phase = _mapping_phase
@@ -398,19 +403,23 @@ def _detection_loop():
             # ── Check if admin triggered a remap ─────────────────────────────
             with _state_lock:
                 do_remap = _remap_requested
+                requested_mode = _remap_layout_mode
                 if do_remap:
                     _remap_requested = False
 
             if do_remap:
-                log.info("[BG] Remap request received — resetting mapper and frame count.")
+                log.info(f"[BG] Remap request received (mode={requested_mode}) — "
+                         f"resetting mapper and frame count.")
                 mapper._detections   = []
                 mapper._frame_count  = 0
                 mapper._slots        = {}
+                mapper.set_layout_mode(requested_mode)
                 local_frame_count    = 0
                 sample_saved         = False
                 with _state_lock:
                     _mapping_phase = True
-                log.info("[BG] Mapper reset. Starting fresh mapping phase (~150 frames)...")
+                log.info(f"[BG] Mapper reset in '{requested_mode}' mode. "
+                         f"Starting fresh mapping phase (~150 frames)...")
 
             # ── Poll Firebase for config changes every 5s ─────────────────────
             now = time.time()
@@ -1177,15 +1186,31 @@ def trigger_remap():
     """
     Admin endpoint — signals the bg thread to reset the AutoMapper object
     and restart the mapping phase.
+
+    Body (optional JSON): { "layout_mode": "horizontal" | "vertical" | "grid" | "auto" }
+    Defaults to "auto" if omitted or invalid.
     """
-    global _remap_requested, _smoothing_hist
+    global _remap_requested, _smoothing_hist, _remap_layout_mode
+
+    data = request.get_json(silent=True) or {}
+    mode = str(data.get("layout_mode", "auto")).lower().strip()
+    valid_modes = {"horizontal", "vertical", "grid", "auto"}
+    if mode not in valid_modes:
+        log.warning(f"[ADMIN] /remap received invalid layout_mode='{mode}' — defaulting to 'auto'.")
+        mode = "auto"
+
     with _state_lock:
-        _remap_requested = True
+        _remap_requested   = True
+        _remap_layout_mode = mode
         _smoothing_hist.clear()   # .clear() mutates the real global dict
     if os.path.exists(SLOT_CONFIG):
         os.remove(SLOT_CONFIG)
-    log.info("[ADMIN] Remap requested — bg thread will reset mapper on next frame.")
-    return jsonify({"status": "remap_started", "message": "Auto-mapping restarted."})
+    log.info(f"[ADMIN] Remap requested (mode={mode}) — bg thread will reset mapper on next frame.")
+    return jsonify({
+        "status":      "remap_started",
+        "layout_mode": mode,
+        "message":     f"Auto-mapping restarted in '{mode}' mode.",
+    })
 
 
 @app.route("/slots", methods=["POST"])

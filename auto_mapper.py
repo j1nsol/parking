@@ -17,8 +17,15 @@ Strategy:
   2. DBSCAN-cluster stationary detections → one cluster per slot.
   3. Fit cv2.minAreaRect() to each cluster → rotated quad that matches
      the actual parking angle.
-  4. Row-based inference fills single-slot gaps within rows.
+  4. Group slots along a configurable axis (horizontal rows, vertical
+     columns, grid, or auto-detect) and fill single/double gaps.
   5. Save to slot_config.json.
+
+Layout modes:
+  - "horizontal": rows of slots parallel to the X axis (group by Y)
+  - "vertical":   columns of slots parallel to the Y axis (group by X)
+  - "grid":       both horizontal rows AND vertical columns; results merged
+  - "auto":       pick per-group orientation from cluster variance (PCA-lite)
 """
 
 import cv2
@@ -35,6 +42,12 @@ STATIONARY_THRESHOLD_PX = 12   # was 20 — lowered so slightly wobbling cars (e
                                 # Raise back to 20 if legitimate parked cars are being skipped.
 MIN_STATIONARY_FRAMES   = 5
 ACCUM_EVERY             = 10
+
+VALID_LAYOUT_MODES = ("horizontal", "vertical", "grid", "auto")
+MIN_GROUP_SIZE_FOR_INFER = 3   # a "row" or "column" must have ≥3 detected
+                                # slots before we trust it enough to fill gaps.
+                                # Prevents two unrelated slots that happen to
+                                # share a Y or X band from spawning road-slots.
 
 
 def rect_to_quad(rect) -> list:
@@ -78,18 +91,26 @@ class AutoMapper:
         eps_pixels: int = 60,
         min_samples: int = 5,
         infer_empty_slots: bool = True,
-        row_merge_tolerance: float = 0.6,
+        group_merge_tolerance: float = 0.6,   # renamed from row_merge_tolerance — applies to
+                                               # either axis depending on layout_mode
         gap_tolerance: float = 0.22,    # NOTE: gap-fill assumes equal slot spacing;
         max_gap_multiplier: float = 2.3, # unequally-spaced lots may miss some inferred slots.
+        layout_mode: str = "horizontal",  # "horizontal" | "vertical" | "grid" | "auto"
     ):
         self.config_path    = slot_config_path
         self.min_detections = min_frames_to_map
         self.eps            = eps_pixels
         self.min_samples    = min_samples
         self.infer_empty    = infer_empty_slots
-        self.row_merge_tol  = row_merge_tolerance
+        self.group_merge_tol = group_merge_tolerance
         self.gap_tolerance  = gap_tolerance
         self.max_gap_mult   = max_gap_multiplier
+
+        if layout_mode not in VALID_LAYOUT_MODES:
+            log.warning(f"Invalid layout_mode '{layout_mode}' — defaulting to 'horizontal'.")
+            layout_mode = "horizontal"
+        self.layout_mode = layout_mode
+        log.info(f"AutoMapper layout_mode = '{self.layout_mode}'")
 
         self._detections: list = []   # (cx,cy,x1,y1,x2,y2)
         self._tracked: dict    = {}   # int id → {cx,cy,x1,y1,x2,y2,still_count}
@@ -100,6 +121,17 @@ class AutoMapper:
         if os.path.exists(slot_config_path):
             self._load_config()
             log.info(f"Loaded existing slot config: {len(self._slots)} slots")
+
+    # ------------------------------------------------------------------
+    # Public: layout mode control
+    # ------------------------------------------------------------------
+    def set_layout_mode(self, mode: str):
+        """Change layout mode (used when admin triggers a remap with a new mode)."""
+        if mode not in VALID_LAYOUT_MODES:
+            log.warning(f"set_layout_mode: invalid mode '{mode}' — ignored.")
+            return
+        self.layout_mode = mode
+        log.info(f"AutoMapper layout_mode changed to '{mode}'")
 
     # ------------------------------------------------------------------
     def feed_frame(self, vehicle_boxes: list, frame_shape: tuple):
@@ -187,91 +219,170 @@ class AutoMapper:
                      f"angle={rect[2]:.1f}° size={round(rect[1][0])}×{round(rect[1][1])}")
 
         if self.infer_empty and len(cluster_data) >= 2:
-            # Fix #8: pass existing slot IDs so inferred names never collide
-            inferred = self._infer_by_row(cluster_data, frame_shape, set(slots.keys()))
+            inferred = self._infer_gaps(cluster_data, frame_shape, set(slots.keys()))
             slots.update(inferred)
             if inferred:
-                log.info(f"Row inference added {len(inferred)} empty slot(s).")
+                log.info(f"Gap inference added {len(inferred)} empty slot(s) "
+                         f"using mode='{self.layout_mode}'.")
 
         self._slots = slots
         self._save_config()
 
     # ------------------------------------------------------------------
-    def _infer_by_row(self, cluster_data, frame_shape, existing_ids: set):
+    # Gap inference — dispatches to the right strategy based on layout_mode
+    # ------------------------------------------------------------------
+    def _infer_gaps(self, cluster_data, frame_shape, existing_ids: set) -> dict:
         """
-        Group quads into rows by Y proximity, then fill gaps within each row.
-        Fix #8: accepts existing_ids set so generated names never collide.
-        Fix #9: fills both single AND double slot gaps (not just single).
-        Inferred slots inherit the averaged quad shape of their neighbors.
+        Dispatch gap inference based on layout_mode.
+          - horizontal: group by Y, fill gaps along X within each row
+          - vertical:   group by X, fill gaps along Y within each column
+          - grid:       run both, deduplicate overlapping inferrals
+          - auto:       decide per-group using variance along each axis
         """
-        # Build a collision-safe ID generator
-        used_ids  = set(existing_ids)
-        counter   = [1]
-        def _next_id():
+        # Collision-safe ID generator — shared across all inference passes
+        used_ids = set(existing_ids)
+        counter  = [1]
+        def next_id():
             while True:
                 candidate = f"S{counter[0]:02d}"
                 counter[0] += 1
                 if candidate not in used_ids:
                     used_ids.add(candidate)
                     return candidate
-        # Estimate median slot diagonal for scale reference
+
+        mode = self.layout_mode
+
+        if mode == "horizontal":
+            return self._infer_along_axis(cluster_data, frame_shape,
+                                           group_axis=1, fill_axis=0, next_id=next_id)
+
+        if mode == "vertical":
+            return self._infer_along_axis(cluster_data, frame_shape,
+                                           group_axis=0, fill_axis=1, next_id=next_id)
+
+        if mode == "grid":
+            horiz = self._infer_along_axis(cluster_data, frame_shape,
+                                            group_axis=1, fill_axis=0, next_id=next_id)
+            # When running the second pass, treat horiz-inferred centers as
+            # "seen" so we don't double-infer the same spot.
+            combined_seen = [(d[0], d[1]) for d in cluster_data]
+            for slot in horiz.values():
+                cx, cy = quad_center(slot["coords"])
+                combined_seen.append((cx, cy))
+            vert = self._infer_along_axis(cluster_data, frame_shape,
+                                           group_axis=0, fill_axis=1, next_id=next_id,
+                                           extra_seen=combined_seen)
+            merged = dict(horiz)
+            merged.update(vert)
+            return merged
+
+        if mode == "auto":
+            return self._infer_auto(cluster_data, frame_shape, next_id)
+
+        # Unknown mode — defensive fallback
+        log.warning(f"_infer_gaps: unknown mode '{mode}' — no inference done.")
+        return {}
+
+    # ------------------------------------------------------------------
+    # Core inference along a single axis
+    # ------------------------------------------------------------------
+    def _infer_along_axis(
+        self,
+        cluster_data,
+        frame_shape,
+        group_axis: int,     # 0=group by X (columns), 1=group by Y (rows)
+        fill_axis: int,      # 0=fill along X,        1=fill along Y
+        next_id,
+        extra_seen: list = None,
+    ) -> dict:
+        """
+        Generic gap-filler. Groups clusters by proximity on `group_axis`, then
+        fills single/double gaps along `fill_axis` within each group.
+
+        For horizontal rows:  group_axis=1 (Y), fill_axis=0 (X)
+        For vertical columns: group_axis=0 (X), fill_axis=1 (Y)
+        """
+        if len(cluster_data) < 2:
+            return {}
+
+        # Median slot diagonal and perpendicular dimension — used as scale references
         diagonals = []
+        perp_sizes = []   # size of slot along group_axis (perpendicular to fill direction)
         for _, _, quad in cluster_data:
             xs = [p[0] for p in quad]
             ys = [p[1] for p in quad]
             diagonals.append(np.hypot(max(xs)-min(xs), max(ys)-min(ys)))
+            # Perpendicular size: if we group by Y, we care about slot height
+            if group_axis == 1:
+                perp_sizes.append(max(ys) - min(ys))
+            else:
+                perp_sizes.append(max(xs) - min(xs))
         med_diag = float(np.median(diagonals))
-        med_h    = float(np.median([max(p[1] for p in q) - min(p[1] for p in q)
-                                    for _,_,q in cluster_data]))
+        med_perp = float(np.median(perp_sizes))
 
-        y_thr    = med_h * self.row_merge_tol
-        max_dist = med_diag * self.max_gap_mult
+        group_thr = med_perp * self.group_merge_tol
+        max_dist  = med_diag * self.max_gap_mult
 
-        points = sorted(cluster_data, key=lambda d: d[1])
-        rows: list = []
+        # Sort by group-axis coordinate, then assign to groups by proximity
+        # cluster_data tuples are (cx, cy, quad); index 0 = cx, index 1 = cy
+        points = sorted(cluster_data, key=lambda d: d[group_axis])
+        groups: list = []
         for pt in points:
             placed = False
-            for row in rows:
-                if abs(pt[1] - np.mean([r[1] for r in row])) < y_thr:
-                    row.append(pt); placed = True; break
+            for grp in groups:
+                mean_coord = np.mean([g[group_axis] for g in grp])
+                if abs(pt[group_axis] - mean_coord) < group_thr:
+                    grp.append(pt)
+                    placed = True
+                    break
             if not placed:
-                rows.append([pt])
+                groups.append([pt])
 
-        log.info(f"Row grouping: {len(cluster_data)} clusters → {len(rows)} rows")
+        axis_name = "row" if group_axis == 1 else "column"
+        log.info(f"[{axis_name.upper()}] grouping: {len(cluster_data)} clusters → {len(groups)} {axis_name}(s)")
 
         inferred = {}
         seen = [(d[0], d[1]) for d in cluster_data]
+        if extra_seen:
+            seen.extend(extra_seen)
 
-        for row_idx, row in enumerate(rows):
-            if len(row) < 2:
+        for grp_idx, grp in enumerate(groups):
+            # Require ≥3 detected slots in a group before trusting it enough
+            # to infer road-adjacent neighbors. A 2-slot group is too weak:
+            # those slots might not actually share a row/column at all.
+            if len(grp) < MIN_GROUP_SIZE_FOR_INFER:
+                log.debug(f"[{axis_name.upper()} {grp_idx}] only {len(grp)} slot(s) "
+                          f"— below threshold {MIN_GROUP_SIZE_FOR_INFER}, skipping inference.")
                 continue
-            row.sort(key=lambda p: p[0])
 
-            for k in range(len(row) - 1):
-                cx_a, cy_a, quad_a = row[k]
-                cx_b, cy_b, quad_b = row[k+1]
+            # Sort along fill axis so adjacent pairs are actual neighbors
+            grp.sort(key=lambda p: p[fill_axis])
+
+            for k in range(len(grp) - 1):
+                a = grp[k]
+                b = grp[k + 1]
+                cx_a, cy_a, quad_a = a
+                cx_b, cy_b, quad_b = b
                 dist = np.hypot(cx_b - cx_a, cy_b - cy_a)
 
                 if dist > max_dist:
-                    log.debug(f"Row {row_idx}: gap {dist:.0f}px > {max_dist:.0f}px — lane")
+                    log.debug(f"[{axis_name.upper()} {grp_idx}]: gap {dist:.0f}px > {max_dist:.0f}px — lane")
                     continue
 
                 expected = med_diag * 1.1
                 tol      = expected * self.gap_tolerance
 
-                # Fix #9: detect both single-slot gaps (2× slot width) and
+                # Detect both single-slot gaps (2× slot width) and
                 # double-slot gaps (3× slot width) between detected clusters.
-                # For each gap size, insert the correct number of inferred slots.
                 gap_slots = None
                 if abs(dist - expected * 2) < tol * 2:
-                    gap_slots = 1   # one slot missing between a and b
+                    gap_slots = 1
                 elif abs(dist - expected * 3) < tol * 3:
-                    gap_slots = 2   # two slots missing between a and b
+                    gap_slots = 2
 
                 if gap_slots is None:
                     continue
 
-                # Insert gap_slots evenly-spaced inferred slots between a and b
                 for gap_i in range(1, gap_slots + 1):
                     frac   = gap_i / (gap_slots + 1)
                     mid_cx = cx_a + frac * (cx_b - cx_a)
@@ -292,7 +403,7 @@ class AutoMapper:
                     dx, dy = mid_cx - avg_cx, mid_cy - avg_cy
                     final_quad = [[round(p[0]+dx), round(p[1]+dy)] for p in avg_quad]
 
-                    sid = _next_id()   # Fix #8: collision-safe ID
+                    sid = next_id()
                     inferred[sid] = {
                         "coords": final_quad,
                         "row":    self._infer_row(mid_cy, frame_shape[0]),
@@ -300,9 +411,85 @@ class AutoMapper:
                     }
                     seen.append((mid_cx, mid_cy))
                     log.info(f"  → Inferred {sid} at ({round(mid_cx)},{round(mid_cy)}) "
-                             f"gap={gap_slots} frac={frac:.2f}")
+                             f"axis={axis_name} gap={gap_slots} frac={frac:.2f}")
 
         return inferred
+
+    # ------------------------------------------------------------------
+    # Auto mode — pick orientation per-group using variance
+    # ------------------------------------------------------------------
+    def _infer_auto(self, cluster_data, frame_shape, next_id) -> dict:
+        """
+        Auto mode: try grouping by both axes, keep whichever produces more
+        usable groups (≥ MIN_GROUP_SIZE_FOR_INFER). If both produce usable
+        groups, run them both (effectively grid mode for this map).
+        If neither does, return empty.
+
+        Rationale: for a vertical column layout, grouping by Y produces many
+        one-element "rows" (nothing to infer), while grouping by X produces
+        one big column. The grouping that yields more members-per-group wins.
+        """
+        # Trial run: how many usable groups does each axis produce?
+        usable_horiz = self._count_usable_groups(cluster_data, group_axis=1)
+        usable_vert  = self._count_usable_groups(cluster_data, group_axis=0)
+
+        log.info(f"[AUTO] Usable groups — horizontal: {usable_horiz}, vertical: {usable_vert}")
+
+        if usable_horiz == 0 and usable_vert == 0:
+            log.info("[AUTO] No axis produced a usable group — no inference.")
+            return {}
+
+        inferred: dict = {}
+        seen_accum = [(d[0], d[1]) for d in cluster_data]
+
+        if usable_horiz > 0:
+            horiz = self._infer_along_axis(
+                cluster_data, frame_shape,
+                group_axis=1, fill_axis=0, next_id=next_id,
+            )
+            for slot in horiz.values():
+                cx, cy = quad_center(slot["coords"])
+                seen_accum.append((cx, cy))
+            inferred.update(horiz)
+
+        if usable_vert > 0:
+            vert = self._infer_along_axis(
+                cluster_data, frame_shape,
+                group_axis=0, fill_axis=1, next_id=next_id,
+                extra_seen=seen_accum,
+            )
+            inferred.update(vert)
+
+        return inferred
+
+    def _count_usable_groups(self, cluster_data, group_axis: int) -> int:
+        """Count how many groups of ≥MIN_GROUP_SIZE_FOR_INFER the given axis produces."""
+        if len(cluster_data) < MIN_GROUP_SIZE_FOR_INFER:
+            return 0
+
+        perp_sizes = []
+        for _, _, quad in cluster_data:
+            if group_axis == 1:
+                ys = [p[1] for p in quad]
+                perp_sizes.append(max(ys) - min(ys))
+            else:
+                xs = [p[0] for p in quad]
+                perp_sizes.append(max(xs) - min(xs))
+        med_perp = float(np.median(perp_sizes))
+        group_thr = med_perp * self.group_merge_tol
+
+        points = sorted(cluster_data, key=lambda d: d[group_axis])
+        groups: list = []
+        for pt in points:
+            placed = False
+            for grp in groups:
+                mean_coord = np.mean([g[group_axis] for g in grp])
+                if abs(pt[group_axis] - mean_coord) < group_thr:
+                    grp.append(pt); placed = True; break
+            if not placed:
+                groups.append([pt])
+
+        return sum(1 for g in groups if len(g) >= MIN_GROUP_SIZE_FOR_INFER)
 
     # ------------------------------------------------------------------
     def _infer_row(self, y_center, frame_height):
