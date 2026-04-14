@@ -213,113 +213,160 @@ def _draw_boxes(frame, vehicle_boxes, slot_results=None):
     return frame
 
 
-# ── Camera singleton ──────────────────────────────────────────────────────────
-# Owned exclusively by the background thread — no lock needed here since
-# only one thread ever touches _cap.
-_cap = None
-
+# ── Camera grabber — single shared RTSP session ──────────────────────────────
+# Previously the bg detection thread and the MJPEG stream thread each opened
+# their own VideoCapture against the same RTSP URL. That caused two problems:
+#   1. Two RTSP sessions to one Hikvision compete for camera CPU and bandwidth,
+#      producing decode failures even when the picture is visually clean.
+#   2. The bg thread sleeps detect_interval (1s) between reads, which is longer
+#      than the H.264 GOP. After waking, the decoder often can't recover because
+#      its reference frames have been evicted — hence sporadic decode failures
+#      during mapping/detection that don't correlate with any visible glitch.
+#
+# Fix: ONE grabber thread continuously decodes at native FPS and publishes the
+# latest frame to shared state. Both the detection loop and the stream loop
+# read from that shared state instead of opening their own captures.
 
 # Max consecutive decode failures before forcing a full reconnect
 _MAX_DECODE_FAILS = 8
 
-def _open_camera(retries: int = 5, delay: float = 3.0):
+# Max age (seconds) a published frame may have before consumers treat it as
+# missing. Should be > one grabber cycle but small enough to detect a hung
+# camera quickly.
+_FRAME_STALE_AFTER = 2.0
+
+# Shared frame state — read by detection loop and stream loop
+_grabber_lock      = threading.Lock()
+_grabber_frame     = None   # latest decoded numpy frame, or None
+_grabber_frame_ts  = 0.0    # time.monotonic() of last successful decode
+_grabber_alive     = False  # True once we have produced at least one frame
+_grabber_stop      = False  # set True to ask the grabber to exit (not used yet)
+
+
+def _open_capture(retries: int = 5, delay: float = 3.0):
     """
-    Open RTSP stream with retry loop and tuned CAP properties.
-    Retries up to `retries` times with `delay` seconds between attempts.
-    Sets low-latency buffer options to reduce H.264 decode lag.
+    Open a fresh RTSP VideoCapture with low-latency settings.
+    Returns the open VideoCapture, or None after exhausting retries.
     """
-    global _cap
     for attempt in range(1, retries + 1):
         log.info(f"[CAM] Opening RTSP stream (attempt {attempt}/{retries})...")
         cap = cv2.VideoCapture(RTSP_URL, cv2.CAP_FFMPEG)
-        # Keep internal buffer minimal — we always want the LATEST frame
-        cap.set(cv2.CAP_PROP_BUFFERSIZE,    1)
-        # Tell FFmpeg not to buffer — reduces latency and H.264 decode errors
-        cap.set(cv2.CAP_PROP_FOURCC,        cv2.VideoWriter_fourcc(*"H264"))
-        cap.set(cv2.CAP_PROP_FPS,           15)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        cap.set(cv2.CAP_PROP_FOURCC,     cv2.VideoWriter_fourcc(*"H264"))
+        cap.set(cv2.CAP_PROP_FPS,        15)
         if cap.isOpened():
             # Warm-up: read and discard a few frames so the decoder is stable
             for _ in range(4):
                 cap.grab()
-            _cap = cap
             log.info("[CAM] Stream opened successfully.")
-            return
+            return cap
         cap.release()
         log.warning(f"[CAM] Attempt {attempt} failed — retrying in {delay}s...")
         time.sleep(delay)
     log.error(f"[CAM] Could not open RTSP stream after {retries} attempts.")
-    _cap = None
+    return None
 
 
-_decode_fail_count = 0   # consecutive decode failures for bg thread camera
-_decode_streak_logged = False   # True once we've logged the start of the current failure streak
-_decode_streak_start_ts = 0.0   # wall-clock time the current streak began — used for recovery summary
+def _grabber_loop():
+    """
+    Sole owner of the RTSP VideoCapture. Decodes continuously at native FPS,
+    publishes the latest frame to _grabber_frame so that consumer threads
+    (detection + MJPEG stream) read from shared state instead of holding
+    their own captures.
+
+    Why continuous decode rather than on-demand? Sleeping between reads on an
+    H.264 stream evicts reference frames from the decoder, causing the next
+    decode to fail. Reading at native FPS keeps the decoder warm and stable.
+
+    Log throttling: a streak of decode failures produces ONE info line at
+    start and one summary on recovery, plus a warning if it persists long
+    enough to trigger a reconnect.
+    """
+    global _grabber_frame, _grabber_frame_ts, _grabber_alive
+
+    cap                   = None
+    decode_fail_count     = 0
+    decode_streak_logged  = False
+    decode_streak_start   = 0.0
+
+    while not _grabber_stop:
+        # (Re)open if needed
+        if cap is None or not cap.isOpened():
+            cap = _open_capture()
+            if cap is None:
+                # Couldn't open — sleep before retrying so we don't hammer
+                time.sleep(2.0)
+                continue
+
+        # Read one frame. No grab()-drain loop here: we are the only consumer
+        # and we read every frame, so the buffer never gets stale.
+        ret, frame = cap.read()
+
+        if ret and frame is not None:
+            # Recovery summary if we were in a failure streak
+            if decode_streak_logged and decode_fail_count > 0:
+                duration = time.time() - decode_streak_start
+                log.info(f"[CAM] Recovered after {decode_fail_count} dropped frame(s) "
+                         f"over {duration:.1f}s")
+            decode_fail_count    = 0
+            decode_streak_logged = False
+
+            # Publish to shared state
+            with _grabber_lock:
+                _grabber_frame    = frame
+                _grabber_frame_ts = time.monotonic()
+                _grabber_alive    = True
+            continue
+
+        # Decode failed
+        decode_fail_count += 1
+        if not decode_streak_logged:
+            decode_streak_logged = True
+            decode_streak_start  = time.time()
+            log.info("[CAM] Frame decode failure — likely camera shake or transient "
+                     "stream glitch. Suppressing further messages until recovery.")
+
+        if decode_fail_count >= _MAX_DECODE_FAILS:
+            duration = time.time() - decode_streak_start
+            log.warning(f"[CAM] {decode_fail_count} consecutive decode failures "
+                        f"over {duration:.1f}s — forcing reconnect.")
+            decode_fail_count    = 0
+            decode_streak_logged = False
+            try:
+                cap.release()
+            except Exception:
+                pass
+            cap = None
+            time.sleep(2.0)   # let the camera breathe before reconnecting
+
+        # Brief pause on failure so we don't burn CPU on a wedged stream
+        else:
+            time.sleep(0.05)
+
 
 def _get_raw_frame():
     """
-    Grab the freshest frame from the RTSP stream.
+    Non-blocking accessor — returns a copy of the latest grabber frame, or
+    None if the grabber hasn't produced a frame yet or its frame is stale.
 
-    Strategy:
-      - Drain stale frames with grab() then do ONE read() for a fresh frame.
-      - Count consecutive decode failures; reconnect after _MAX_DECODE_FAILS.
-      - On reconnect, back off 2 s to let the camera recover (avoids hammering).
-      - Log throttling: log only the START of a failure streak and its END
-        (with a summary), not every individual decode glitch. Camera shake
-        and brief H.264 corruption no longer flood the CLI.
+    Returning a copy means consumers can safely undistort/annotate without
+    racing the grabber overwriting _grabber_frame mid-read.
     """
-    global _cap, _decode_fail_count, _decode_streak_logged, _decode_streak_start_ts
-
-    if _cap is None or not _cap.isOpened():
-        _open_camera()
-        if _cap is None:
+    with _grabber_lock:
+        if _grabber_frame is None:
             return None
+        age = time.monotonic() - _grabber_frame_ts
+        if age > _FRAME_STALE_AFTER:
+            return None
+        return _grabber_frame.copy()
 
-    # Drain buffered frames — grab without decode (cheap)
-    for _ in range(3):
-        _cap.grab()
 
-    # Read one fresh frame (grab + decode combined)
-    ret, frame = _cap.read()
-
-    if ret and frame is not None:
-        # If we were in a failure streak, log the recovery summary now
-        if _decode_streak_logged and _decode_fail_count > 0:
-            duration = time.time() - _decode_streak_start_ts
-            log.info(f"[CAM] Recovered after {_decode_fail_count} dropped frame(s) "
-                     f"over {duration:.1f}s")
-        _decode_fail_count   = 0
-        _decode_streak_logged = False
-        return frame
-
-    # Decode failed
-    _decode_fail_count += 1
-
-    # Log the START of a streak exactly once at INFO level (not WARNING — it's
-    # not actionable on its own; only sustained failures matter).
-    if not _decode_streak_logged:
-        _decode_streak_logged   = True
-        _decode_streak_start_ts = time.time()
-        log.info("[CAM] Frame decode failure — likely camera shake or transient "
-                 "stream glitch. Suppressing further messages until recovery.")
-
-    if _decode_fail_count >= _MAX_DECODE_FAILS:
-        # Sustained failure — escalate. Log this at WARNING because we are
-        # actually doing something (full reconnect) that the operator may
-        # care about.
-        duration = time.time() - _decode_streak_start_ts
-        log.warning(f"[CAM] {_decode_fail_count} consecutive decode failures "
-                    f"over {duration:.1f}s — forcing reconnect.")
-        _decode_fail_count    = 0
-        _decode_streak_logged = False
-        try:
-            _cap.release()
-        except Exception:
-            pass
-        _cap = None
-        time.sleep(2.0)   # let the camera breathe before reconnecting
-        _open_camera()
-
-    return None
+def _frame_age() -> float:
+    """How old (seconds) the latest published frame is. inf if none yet."""
+    with _grabber_lock:
+        if _grabber_frame is None:
+            return float("inf")
+        return time.monotonic() - _grabber_frame_ts
 
 
 # ── Background detection + sync thread ───────────────────────────────────────
@@ -417,7 +464,15 @@ def _detection_loop():
                                 # to throttle the "[BG] No frame" log line so
                                 # camera glitches don't flood the CLI.
 
-    _open_camera()
+    # Camera is owned by the grabber thread (started below). Wait briefly for
+    # the first frame to arrive before entering the main loop, just so we
+    # don't immediately log a "no frame" warning at startup.
+    log.info("[BG] Waiting for first frame from grabber...")
+    for _ in range(50):   # up to ~5 seconds
+        if _get_raw_frame() is not None:
+            break
+        time.sleep(0.1)
+    log.info("[BG] Detection loop running.")
 
     while True:
         try:
@@ -620,122 +675,78 @@ _stream_lock    = threading.Lock()
 
 def _stream_loop():
     """
-    Dedicated thread: grabs frames at STREAM_FPS, overlays latest YOLO results,
-    pushes annotated JPEGs to _stream_queue for MJPEG clients.
+    Dedicated thread: pulls the latest frame from the shared grabber, overlays
+    YOLO results, and pushes annotated JPEGs to _stream_queue for MJPEG clients.
     Only runs when at least one browser tab has the stream open.
 
-    Robustness improvements:
-      - open_cap() sets identical low-latency options as _open_camera()
-      - Decode failures are counted; reconnect only after N consecutive fails
-        to avoid thrashing on a momentary H.264 glitch
-      - Exponential back-off on reconnect (2 s cap) prevents camera hammering
+    Architecture change: previously this thread held its own VideoCapture
+    against the same RTSP URL as the bg detection thread, causing camera-side
+    contention. Now both threads share the grabber's _grabber_frame, so there
+    is exactly one RTSP session open at a time.
     """
     global _stream_clients
-    cap              = None
-    interval         = 1.0 / STREAM_FPS
-    stream_fail_count = 0
-    MAX_STREAM_FAILS  = 6
-    reconnect_delay   = 1.0   # grows on repeated failures, caps at 8 s
-    stream_streak_logged = False     # log throttling — first fail of a streak only
-    stream_streak_start  = 0.0       # wall-clock start of current failure streak
+    interval               = 1.0 / STREAM_FPS
+    no_frame_streak        = 0       # consecutive iterations with no frame from grabber
+    no_frame_streak_logged = False
 
-    # Fix #3: cache the undistorter — only rebuild when config actually changes
-    _cached_udist      = None
-    _cached_udist_cfg  = {}
-
-    def open_cap():
-        """Open a fresh VideoCapture with the same low-latency settings as bg thread."""
-        c = cv2.VideoCapture(RTSP_URL, cv2.CAP_FFMPEG)
-        c.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        c.set(cv2.CAP_PROP_FOURCC,     cv2.VideoWriter_fourcc(*"H264"))
-        c.set(cv2.CAP_PROP_FPS,        15)
-        if c.isOpened():
-            for _ in range(3):   # warm-up grab
-                c.grab()
-        return c
+    # Cache the undistorter — only rebuild when config actually changes
+    _cached_udist     = None
+    _cached_udist_cfg = {}
 
     while True:
-        # If no clients, sleep and release camera to save resources
+        # If no clients, idle. We don't need to "release" anything because we
+        # don't own a capture — the grabber stays connected regardless.
         with _stream_lock:
             clients = _stream_clients
         if clients == 0:
-            if cap and cap.isOpened():
-                cap.release()
-                cap = None
-                stream_fail_count = 0
-                reconnect_delay   = 1.0
-                log.info("[STREAM] No clients — camera released.")
             time.sleep(0.5)
+            no_frame_streak        = 0
+            no_frame_streak_logged = False
             continue
-
-        # Open camera if needed
-        if cap is None or not cap.isOpened():
-            log.info("[STREAM] Opening stream camera...")
-            cap = open_cap()
-            if not cap.isOpened():
-                log.warning(f"[STREAM] Camera open failed — retrying in {reconnect_delay:.1f}s")
-                time.sleep(reconnect_delay)
-                reconnect_delay = min(reconnect_delay * 2, 8.0)
-                cap = None
-                continue
-            reconnect_delay = 1.0   # reset on success
 
         t0 = time.time()
 
-        # Drain stale buffered frames cheaply, then read one fresh frame
-        cap.grab(); cap.grab()
-        ret, frame = cap.read()
+        frame = _get_raw_frame()
 
-        if not ret or frame is None:
-            stream_fail_count += 1
-            # Log only the first failure of a streak — not every glitched frame.
-            if not stream_streak_logged:
-                stream_streak_logged = True
-                stream_streak_start  = time.time()
-                log.info("[STREAM] Frame decode failure — likely camera shake. "
-                         "Suppressing further messages until recovery.")
-            if stream_fail_count >= MAX_STREAM_FAILS:
-                duration = time.time() - stream_streak_start
-                log.warning(f"[STREAM] {stream_fail_count} consecutive failures "
-                            f"over {duration:.1f}s — reconnecting...")
-                try:
-                    cap.release()
-                except Exception:
-                    pass
-                cap = None
-                stream_fail_count    = 0
-                stream_streak_logged = False
-                time.sleep(reconnect_delay)
-                reconnect_delay = min(reconnect_delay * 2, 8.0)
+        if frame is None:
+            no_frame_streak += 1
+            # Log only the first miss of a streak; grabber already logs its
+            # own decode failures, so this is just extra context for the
+            # stream-side perspective.
+            if not no_frame_streak_logged and no_frame_streak >= 5:
+                no_frame_streak_logged = True
+                log.info("[STREAM] No fresh frames from grabber — waiting...")
+            time.sleep(interval)
             continue
 
-        # Recovered — summarize if there was a meaningful streak
-        if stream_streak_logged and stream_fail_count > 0:
-            duration = time.time() - stream_streak_start
-            log.info(f"[STREAM] Recovered after {stream_fail_count} dropped "
-                     f"frame(s) over {duration:.1f}s")
-        stream_fail_count    = 0
-        stream_streak_logged = False
-        reconnect_delay      = 1.0
+        # Recovery
+        if no_frame_streak_logged:
+            log.info(f"[STREAM] Frames flowing again after {no_frame_streak} miss(es).")
+        no_frame_streak        = 0
+        no_frame_streak_logged = False
 
         # Apply undistortion if enabled
         with _state_lock:
             udist_cfg = dict(_undistort_cfg)
         if udist_cfg.get("enabled"):
             try:
-                from undistort import WideAngleUndistorter
-                u = WideAngleUndistorter(
-                    k1=udist_cfg["k1"], k2=udist_cfg["k2"], alpha=udist_cfg["alpha"]
-                )
-                frame = u.process(frame)
+                # Rebuild only when config actually changes
+                if udist_cfg != _cached_udist_cfg:
+                    from undistort import WideAngleUndistorter
+                    _cached_udist = WideAngleUndistorter(
+                        k1=udist_cfg["k1"], k2=udist_cfg["k2"], alpha=udist_cfg["alpha"]
+                    )
+                    _cached_udist_cfg = dict(udist_cfg)
+                if _cached_udist is not None:
+                    frame = _cached_udist.process(frame)
             except Exception:
                 pass
 
-        # Read latest YOLO overlay (no lock held during draw — just stale data is fine)
+        # Read latest YOLO overlay (no lock held during draw — stale data is fine)
         with _state_lock:
-            vboxes      = list(_latest_vehicle_boxes)
-            slot_res    = list(_latest_slot_results)
-            mapping     = _mapping_phase
+            vboxes   = list(_latest_vehicle_boxes)
+            slot_res = list(_latest_slot_results)
+            mapping  = _mapping_phase
 
         # Draw overlay
         annotated = _draw_boxes(frame, vboxes, slot_res if not mapping else None)
@@ -764,6 +775,11 @@ def _stream_loop():
 
 
 # ── Start background threads on import ───────────────────────────────────────
+# Order matters: grabber must start first so consumers have frames to read.
+_grabber_thread = threading.Thread(target=_grabber_loop, name="frame-grabber", daemon=True)
+_grabber_thread.start()
+log.info("[MAIN] Frame grabber thread started.")
+
 _bg_thread = threading.Thread(target=_detection_loop, name="detection-loop", daemon=True)
 _bg_thread.start()
 log.info("[MAIN] Background detection thread started.")
