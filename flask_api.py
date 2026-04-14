@@ -252,6 +252,8 @@ def _open_camera(retries: int = 5, delay: float = 3.0):
 
 
 _decode_fail_count = 0   # consecutive decode failures for bg thread camera
+_decode_streak_logged = False   # True once we've logged the start of the current failure streak
+_decode_streak_start_ts = 0.0   # wall-clock time the current streak began — used for recovery summary
 
 def _get_raw_frame():
     """
@@ -261,8 +263,11 @@ def _get_raw_frame():
       - Drain stale frames with grab() then do ONE read() for a fresh frame.
       - Count consecutive decode failures; reconnect after _MAX_DECODE_FAILS.
       - On reconnect, back off 2 s to let the camera recover (avoids hammering).
+      - Log throttling: log only the START of a failure streak and its END
+        (with a summary), not every individual decode glitch. Camera shake
+        and brief H.264 corruption no longer flood the CLI.
     """
-    global _cap, _decode_fail_count
+    global _cap, _decode_fail_count, _decode_streak_logged, _decode_streak_start_ts
 
     if _cap is None or not _cap.isOpened():
         _open_camera()
@@ -277,16 +282,35 @@ def _get_raw_frame():
     ret, frame = _cap.read()
 
     if ret and frame is not None:
-        _decode_fail_count = 0
+        # If we were in a failure streak, log the recovery summary now
+        if _decode_streak_logged and _decode_fail_count > 0:
+            duration = time.time() - _decode_streak_start_ts
+            log.info(f"[CAM] Recovered after {_decode_fail_count} dropped frame(s) "
+                     f"over {duration:.1f}s")
+        _decode_fail_count   = 0
+        _decode_streak_logged = False
         return frame
 
     # Decode failed
     _decode_fail_count += 1
-    log.warning(f"[CAM] Decode failure #{_decode_fail_count} — "
-                f"{'reconnecting...' if _decode_fail_count >= _MAX_DECODE_FAILS else 'retrying'}")
+
+    # Log the START of a streak exactly once at INFO level (not WARNING — it's
+    # not actionable on its own; only sustained failures matter).
+    if not _decode_streak_logged:
+        _decode_streak_logged   = True
+        _decode_streak_start_ts = time.time()
+        log.info("[CAM] Frame decode failure — likely camera shake or transient "
+                 "stream glitch. Suppressing further messages until recovery.")
 
     if _decode_fail_count >= _MAX_DECODE_FAILS:
-        _decode_fail_count = 0
+        # Sustained failure — escalate. Log this at WARNING because we are
+        # actually doing something (full reconnect) that the operator may
+        # care about.
+        duration = time.time() - _decode_streak_start_ts
+        log.warning(f"[CAM] {_decode_fail_count} consecutive decode failures "
+                    f"over {duration:.1f}s — forcing reconnect.")
+        _decode_fail_count    = 0
+        _decode_streak_logged = False
         try:
             _cap.release()
         except Exception:
@@ -389,6 +413,9 @@ def _detection_loop():
     local_frame_count = 0
     last_prog_check   = 0
     last_yolo_frame   = None   # last YOLO result, reused on skipped frames
+    no_frame_streak   = 0      # consecutive iterations with no frame — used
+                                # to throttle the "[BG] No frame" log line so
+                                # camera glitches don't flood the CLI.
 
     _open_camera()
 
@@ -396,9 +423,20 @@ def _detection_loop():
         try:
             frame = _get_raw_frame()
             if frame is None:
-                log.warning("[BG] No frame — retrying in 1s")
+                no_frame_streak += 1
+                # Log the first miss, then again every 30s of sustained outage.
+                # Avoids one warning per second when the camera is briefly down.
+                if no_frame_streak == 1 or no_frame_streak % 30 == 0:
+                    log.warning(f"[BG] No frame for {no_frame_streak}s — "
+                                f"camera offline or stream stalled.")
                 time.sleep(1)
                 continue
+
+            # Frame recovered
+            if no_frame_streak > 0:
+                if no_frame_streak >= 3:   # only summarize meaningful outages
+                    log.info(f"[BG] Frames flowing again after {no_frame_streak}s outage.")
+                no_frame_streak = 0
 
             # ── Check if admin triggered a remap ─────────────────────────────
             with _state_lock:
@@ -598,6 +636,8 @@ def _stream_loop():
     stream_fail_count = 0
     MAX_STREAM_FAILS  = 6
     reconnect_delay   = 1.0   # grows on repeated failures, caps at 8 s
+    stream_streak_logged = False     # log throttling — first fail of a streak only
+    stream_streak_start  = 0.0       # wall-clock start of current failure streak
 
     # Fix #3: cache the undistorter — only rebuild when config actually changes
     _cached_udist      = None
@@ -648,21 +688,35 @@ def _stream_loop():
 
         if not ret or frame is None:
             stream_fail_count += 1
-            log.warning(f"[STREAM] Decode failure #{stream_fail_count}")
+            # Log only the first failure of a streak — not every glitched frame.
+            if not stream_streak_logged:
+                stream_streak_logged = True
+                stream_streak_start  = time.time()
+                log.info("[STREAM] Frame decode failure — likely camera shake. "
+                         "Suppressing further messages until recovery.")
             if stream_fail_count >= MAX_STREAM_FAILS:
-                log.warning("[STREAM] Too many failures — reconnecting...")
+                duration = time.time() - stream_streak_start
+                log.warning(f"[STREAM] {stream_fail_count} consecutive failures "
+                            f"over {duration:.1f}s — reconnecting...")
                 try:
                     cap.release()
                 except Exception:
                     pass
                 cap = None
-                stream_fail_count = 0
+                stream_fail_count    = 0
+                stream_streak_logged = False
                 time.sleep(reconnect_delay)
                 reconnect_delay = min(reconnect_delay * 2, 8.0)
             continue
 
-        stream_fail_count = 0
-        reconnect_delay   = 1.0
+        # Recovered — summarize if there was a meaningful streak
+        if stream_streak_logged and stream_fail_count > 0:
+            duration = time.time() - stream_streak_start
+            log.info(f"[STREAM] Recovered after {stream_fail_count} dropped "
+                     f"frame(s) over {duration:.1f}s")
+        stream_fail_count    = 0
+        stream_streak_logged = False
+        reconnect_delay      = 1.0
 
         # Apply undistortion if enabled
         with _state_lock:
