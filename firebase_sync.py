@@ -28,16 +28,18 @@ DEFAULT_PROGRAM_CONFIG = {
 
 
 class FirebaseSync:
-    def __init__(self, credentials_path: str, database_url: str):
+    def __init__(self, credentials_path: str, database_url: str, parking_path: str = "parking"):
         """
         Args:
             credentials_path: Path to Firebase service account JSON key.
             database_url:     Firebase Realtime Database URL.
+            parking_path:     Root path in the DB for occupancy data (default "parking").
         """
+        self._parking_path = parking_path.strip("/")
         try:
             cred = credentials.Certificate(credentials_path)
             firebase_admin.initialize_app(cred, {"databaseURL": database_url})
-            log.info("Firebase connected successfully.")
+            log.info(f"Firebase connected successfully (path=/{self._parking_path}).")
         except Exception as e:
             log.error(f"Firebase init failed: {e}")
             raise
@@ -67,7 +69,7 @@ class FirebaseSync:
         }
 
         try:
-            db.reference("/parking").set(payload)
+            db.reference(f"/{self._parking_path}").set(payload)
         except Exception as e:
             log.warning(f"Firebase push failed (will retry next cycle): {e}")
 
@@ -80,7 +82,8 @@ class FirebaseSync:
         can render the parking map overlay.
         """
         try:
-            db.reference("/slot_layout").set(slots)
+            db.reference(f"/{self._parking_path}/slot_layout").set(slots)
+            db.reference(f"/{self._parking_path}_layout").set(slots)
             log.info("Slot layout pushed to Firebase.")
         except Exception as e:
             log.warning(f"Failed to push slot layout: {e}")

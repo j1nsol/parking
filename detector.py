@@ -22,7 +22,7 @@ os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
 class ParkingDetector:
     def __init__(
         self,
-        model_path: str = "yolov8n.pt",
+        model_path: str = "best.pt",
         rtsp_url: str = RTSP_URL,
         confidence: float = 0.20,
         target_classes: list = None,
@@ -43,7 +43,7 @@ class ParkingDetector:
             zoom:             Zoom level for undistortion (0.5-1.0).
         """
         self.conf = confidence
-        self.target_classes = target_classes or [2, 5, 7]
+        self.target_classes = target_classes or [0]
         self.smoothing_window = smoothing_window
         self.rtsp_url = rtsp_url
 

@@ -15,6 +15,7 @@ import cv2
 import json
 import time
 import os
+import tempfile
 import threading
 import logging
 import numpy as np
@@ -47,6 +48,10 @@ DETECT_INTERVAL = 1.0         # seconds between detection cycles
 FIREBASE_EVERY  = 2           # push Firebase every N detection cycles
 MAPPER_EPS_PX   = 40          # DBSCAN eps pixels — lower separates close-parked cars better
 
+FIREBASE_ENABLED      = True          # set False to disable Firebase entirely
+FIREBASE_PARKING_PATH = "parking"     # Pi uses "parking" (production path)
+VIDEO_SOURCE          = RTSP_URL      # keep as RTSP_URL on Pi
+
 # Fisheye undistortion — values are live-fetched from Firebase every 5s.
 # These are only the startup fallback defaults used before Firebase responds.
 UNDISTORT   = False
@@ -58,15 +63,18 @@ UNDISTORT_POLL_INTERVAL = 5
 
 # Force TCP transport and suppress H.264/RTSP decoder noise.
 # These must be set before any VideoCapture call.
-os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
-    "rtsp_transport;tcp"
-    "|fflags;nobuffer"
-    "|flags;low_delay"
-    "|max_delay;0"
-    "|reorder_queue_size;0"
-    "|analyzeduration;1000000"   # 1 s — faster stream open
-    "|probesize;1000000"
-)
+_using_rtsp = isinstance(VIDEO_SOURCE, str) and VIDEO_SOURCE.lower().startswith("rtsp://")
+if _using_rtsp:
+    os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
+        "rtsp_transport;tcp"
+        "|stimeout;5000000"
+        "|fflags;nobuffer"
+        "|flags;low_delay"
+        "|max_delay;0"
+        "|reorder_queue_size;0"
+        "|analyzeduration;1000000"   # 1 s — faster stream open
+        "|probesize;1000000"
+    )
 # Suppress noisy H.264/FFmpeg log spam on stderr (Pi logs fill up fast)
 os.environ["OPENCV_LOG_LEVEL"]        = "ERROR"
 os.environ["OPENCV_FFMPEG_LOGLEVEL"]  = "8"   # AV_LOG_FATAL only
@@ -242,6 +250,14 @@ _grabber_frame_ts  = 0.0    # time.monotonic() of last successful decode
 _grabber_alive     = False  # True once we have produced at least one frame
 _grabber_stop      = False  # set True to ask the grabber to exit (not used yet)
 
+# ── Video file playback state ─────────────────────────────────────────────────
+_vid_lock   = threading.Lock()
+_vid_path   = None       # path to loaded temp file, or None
+_vid_state  = "stopped"  # "stopped" | "playing" | "paused"
+_vid_frame  = 0          # current frame index
+_vid_total  = 0          # total frames in loaded video
+_vid_fps    = 25.0       # native FPS of loaded video
+
 
 def _open_capture(retries: int = 5, delay: float = 3.0):
     """
@@ -269,49 +285,113 @@ def _open_capture(retries: int = 5, delay: float = 3.0):
 
 def _grabber_loop():
     """
-    Sole owner of the RTSP VideoCapture. Decodes continuously at native FPS,
-    publishes the latest frame to _grabber_frame so that consumer threads
-    (detection + MJPEG stream) read from shared state instead of holding
-    their own captures.
+    Sole owner of all VideoCapture instances. Handles two modes:
+      - Video file: reads the loaded file at its native FPS; supports
+        play / pause / stop commands via _vid_* globals.
+      - Live source (RTSP / webcam): continuously decodes at native FPS
+        so the H.264 decoder stays warm and reference frames don't evict.
 
-    Why continuous decode rather than on-demand? Sleeping between reads on an
-    H.264 stream evicts reference frames from the decoder, causing the next
-    decode to fail. Reading at native FPS keeps the decoder warm and stable.
-
-    Log throttling: a streak of decode failures produces ONE info line at
-    start and one summary on recovery, plus a warning if it persists long
-    enough to trigger a reconnect.
+    Both modes publish frames to the same _grabber_frame shared state so
+    the detection loop and MJPEG stream loop don't care which source is active.
     """
     global _grabber_frame, _grabber_frame_ts, _grabber_alive
+    global _vid_frame, _vid_state
 
-    cap                   = None
+    live_cap              = None
+    vid_cap               = None
     decode_fail_count     = 0
     decode_streak_logged  = False
     decode_streak_start   = 0.0
 
     while not _grabber_stop:
-        # (Re)open if needed
-        if cap is None or not cap.isOpened():
-            cap = _open_capture()
-            if cap is None:
-                # Couldn't open — sleep before retrying so we don't hammer
+        # ── Video file mode ──────────────────────────────────────────────────
+        with _vid_lock:
+            vid_path  = _vid_path
+            vid_state = _vid_state
+            vid_fps   = _vid_fps
+            vid_total = _vid_total
+
+        # Pi repo: idle if no video is loaded and not using RTSP (e.g. local dev).
+        if vid_path is None and not RTSP_URL.startswith("rtsp://"):
+            time.sleep(0.1)
+            continue
+
+        if vid_path is not None and vid_state == "playing":
+            # Release live cap while video is active
+            if live_cap is not None:
+                try: live_cap.release()
+                except Exception: pass
+                live_cap = None
+                decode_fail_count    = 0
+                decode_streak_logged = False
+
+            # Open (or reuse) the video capture
+            if vid_cap is None or not vid_cap.isOpened():
+                vid_cap = cv2.VideoCapture(vid_path)
+
+            ret, frame = vid_cap.read()
+            if ret and frame is not None:
+                with _vid_lock:
+                    _vid_frame = min(_vid_frame + 1, vid_total)
+                with _grabber_lock:
+                    _grabber_frame    = frame
+                    _grabber_frame_ts = time.monotonic()
+                    _grabber_alive    = True
+                time.sleep(1.0 / max(vid_fps, 1))
+            else:
+                # End of file — auto-stop
+                log.info("[VID] Playback finished.")
+                with _vid_lock:
+                    _vid_state = "stopped"
+                    _vid_frame = 0
+                if vid_cap is not None:
+                    vid_cap.release()
+                    vid_cap = None
+            continue
+
+        if vid_path is not None and vid_state == "paused":
+            # Keep last frame visible; release live cap
+            if live_cap is not None:
+                try: live_cap.release()
+                except Exception: pass
+                live_cap = None
+            time.sleep(0.05)
+            continue
+
+        if vid_path is not None and vid_state == "stopped":
+            # Release video cap and fall through to live source
+            if vid_cap is not None:
+                try: vid_cap.release()
+                except Exception: pass
+                vid_cap = None
+            # If no live source configured, just idle
+            if RTSP_URL.startswith("rtsp://") and "YOUR" not in RTSP_URL:
+                pass  # fall through to live source below
+            else:
+                time.sleep(0.1)
+                continue
+
+        # ── Live source mode (RTSP / webcam) ─────────────────────────────────
+        if vid_cap is not None:
+            try: vid_cap.release()
+            except Exception: pass
+            vid_cap = None
+
+        if live_cap is None or not live_cap.isOpened():
+            live_cap = _open_capture()
+            if live_cap is None:
                 time.sleep(2.0)
                 continue
 
-        # Read one frame. No grab()-drain loop here: we are the only consumer
-        # and we read every frame, so the buffer never gets stale.
-        ret, frame = cap.read()
+        ret, frame = live_cap.read()
 
         if ret and frame is not None:
-            # Recovery summary if we were in a failure streak
             if decode_streak_logged and decode_fail_count > 0:
                 duration = time.time() - decode_streak_start
                 log.info(f"[CAM] Recovered after {decode_fail_count} dropped frame(s) "
                          f"over {duration:.1f}s")
             decode_fail_count    = 0
             decode_streak_logged = False
-
-            # Publish to shared state
             with _grabber_lock:
                 _grabber_frame    = frame
                 _grabber_frame_ts = time.monotonic()
@@ -323,8 +403,7 @@ def _grabber_loop():
         if not decode_streak_logged:
             decode_streak_logged = True
             decode_streak_start  = time.time()
-            log.info("[CAM] Frame decode failure — likely camera shake or transient "
-                     "stream glitch. Suppressing further messages until recovery.")
+            log.info("[CAM] Frame decode failure — suppressing further messages until recovery.")
 
         if decode_fail_count >= _MAX_DECODE_FAILS:
             duration = time.time() - decode_streak_start
@@ -333,13 +412,12 @@ def _grabber_loop():
             decode_fail_count    = 0
             decode_streak_logged = False
             try:
-                cap.release()
+                live_cap.release()
             except Exception:
                 pass
-            cap = None
-            time.sleep(2.0)   # let the camera breathe before reconnecting
+            live_cap = None
+            time.sleep(2.0)
 
-        # Brief pause on failure so we don't burn CPU on a wedged stream
         else:
             time.sleep(0.05)
 
@@ -385,14 +463,18 @@ def _detection_loop():
 
     # ── Firebase ──────────────────────────────────────────────────────────────
     firebase = None
-    try:
-        firebase = FirebaseSync(
-            credentials_path=CREDENTIALS,
-            database_url=FIREBASE_URL,
-        )
-        firebase_instance = firebase
-    except Exception as e:
-        log.error(f"[FB] Firebase init failed — occupancy won't be synced: {e}")
+    if FIREBASE_ENABLED:
+        try:
+            firebase = FirebaseSync(
+                credentials_path=CREDENTIALS,
+                database_url=FIREBASE_URL,
+                parking_path=FIREBASE_PARKING_PATH,
+            )
+            firebase_instance = firebase
+        except Exception as e:
+            log.error(f"[FB] Firebase init failed — occupancy won't be synced: {e}")
+    else:
+        log.info("[FB] Firebase disabled — running in local-only mode.")
 
     # ── Auto-mapper ───────────────────────────────────────────────────────────
     with _state_lock:
@@ -1369,6 +1451,107 @@ def delete_slot(slot_id):
 
     log.info(f"[ADMIN] Slot {slot_id} deleted.")
     return jsonify({"status": "ok", "slot_id": slot_id})
+
+
+# ── Video file playback endpoints ─────────────────────────────────────────────
+@app.route("/video/load", methods=["POST"])
+def video_load():
+    """Accept an uploaded video file and prepare it for playback."""
+    global _vid_path, _vid_state, _vid_frame, _vid_total, _vid_fps
+    f = request.files.get("video")
+    if not f:
+        return jsonify({"error": "no file uploaded"}), 400
+    ext = os.path.splitext(f.filename or "video.mp4")[1] or ".mp4"
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=ext)
+    f.save(tmp.name)
+    tmp.close()
+    cap   = cv2.VideoCapture(tmp.name)
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps   = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    cap.release()
+    with _vid_lock:
+        if _vid_path and os.path.exists(_vid_path):
+            try: os.unlink(_vid_path)
+            except Exception: pass
+        _vid_path  = tmp.name
+        _vid_state = "stopped"
+        _vid_frame = 0
+        _vid_total = total
+        _vid_fps   = fps
+    log.info(f"[VID] Loaded {f.filename} — {total} frames @ {fps:.1f} FPS")
+    return jsonify({"status": "loaded", "total": total, "fps": round(fps, 1)})
+
+
+@app.route("/video/start", methods=["POST"])
+def video_start():
+    """Start or resume video playback."""
+    global _vid_state
+    with _vid_lock:
+        if not _vid_path:
+            return jsonify({"error": "no video loaded"}), 400
+        _vid_state = "playing"
+    log.info("[VID] Playback started.")
+    return jsonify({"status": "playing"})
+
+
+@app.route("/video/pause", methods=["POST"])
+def video_pause():
+    """Pause video playback."""
+    global _vid_state
+    with _vid_lock:
+        _vid_state = "paused"
+    log.info("[VID] Playback paused.")
+    return jsonify({"status": "paused"})
+
+
+@app.route("/video/stop", methods=["POST"])
+def video_stop():
+    """Stop video playback and reset to beginning."""
+    global _vid_state, _vid_frame
+    with _vid_lock:
+        _vid_state = "stopped"
+        _vid_frame = 0
+    log.info("[VID] Playback stopped.")
+    return jsonify({"status": "stopped"})
+
+
+@app.route("/video/unload", methods=["POST"])
+def video_unload():
+    """Delete the loaded temp file and resume live source."""
+    global _vid_path, _vid_state, _vid_frame, _vid_total, _vid_fps
+    with _vid_lock:
+        path       = _vid_path
+        _vid_path  = None
+        _vid_state = "stopped"
+        _vid_frame = 0
+        _vid_total = 0
+        _vid_fps   = 25.0
+    if path and os.path.exists(path):
+        try:
+            os.unlink(path)
+        except Exception:
+            pass
+    log.info("[VID] Video unloaded; resuming live source.")
+    return jsonify({"status": "unloaded"})
+
+
+@app.route("/video/status", methods=["GET"])
+def video_status():
+    """Return current video playback state."""
+    with _vid_lock:
+        state = _vid_state
+        frame = _vid_frame
+        total = _vid_total
+        fps   = _vid_fps
+        path  = _vid_path
+    source = "video" if (path and state in ("playing", "paused")) else "rtsp"
+    return jsonify({
+        "state":  state,
+        "frame":  frame,
+        "total":  total,
+        "fps":    round(fps, 1),
+        "source": source,
+    })
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
