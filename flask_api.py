@@ -1458,6 +1458,7 @@ def delete_slot(slot_id):
 def video_load():
     """Accept an uploaded video file and prepare it for playback."""
     global _vid_path, _vid_state, _vid_frame, _vid_total, _vid_fps
+    log.info(f"[VID] /video/load — content_type={request.content_type!r} files={list(request.files.keys())} form={list(request.form.keys())}")
     f = request.files.get("video")
     if not f:
         return jsonify({"error": "no file uploaded"}), 400
@@ -1465,7 +1466,11 @@ def video_load():
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=ext)
     f.save(tmp.name)
     tmp.close()
-    cap   = cv2.VideoCapture(tmp.name)
+    cap = cv2.VideoCapture(tmp.name)
+    if not cap.isOpened():
+        cap.release()
+        os.unlink(tmp.name)
+        return jsonify({"error": "OpenCV could not open the video file — FFMPEG support may be missing on this device"}), 422
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     fps   = cap.get(cv2.CAP_PROP_FPS) or 25.0
     cap.release()
