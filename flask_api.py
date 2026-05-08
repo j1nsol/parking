@@ -83,7 +83,7 @@ os.environ["OPENCV_FFMPEG_LOGLEVEL"]  = "8"   # AV_LOG_FATAL only
 # Fix #1: YOLO inference is NOT thread-safe. Guard every model() call with
 # this lock so the bg detection thread and /analyze-image never run together.
 log.info("Loading YOLOv8n model...")
-model      = YOLO("yolov8n.pt")
+model      = YOLO("best.pt")
 _yolo_lock = threading.Lock()
 log.info("Model ready.")
 
@@ -886,7 +886,7 @@ def status():
         "slots_loaded":  slots_loaded,
         "mapping_phase": mapping,
         "frame_count":   frame_count,
-        "model":         "yolov8n",
+        "model":         "best",
         "mapper_eps_px": MAPPER_EPS_PX,
         "timestamp":     int(time.time() * 1000),
     })
