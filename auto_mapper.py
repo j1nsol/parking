@@ -96,6 +96,7 @@ class AutoMapper:
         gap_tolerance: float = 0.22,    # NOTE: gap-fill assumes equal slot spacing;
         max_gap_multiplier: float = 2.3, # unequally-spaced lots may miss some inferred slots.
         layout_mode: str = "horizontal",  # "horizontal" | "vertical" | "grid" | "auto"
+        row_guides: list = [],            # Y pixel values from /remap; empty = use thirds fallback
     ):
         self.config_path    = slot_config_path
         self.min_detections = min_frames_to_map
@@ -105,6 +106,7 @@ class AutoMapper:
         self.group_merge_tol = group_merge_tolerance
         self.gap_tolerance  = gap_tolerance
         self.max_gap_mult   = max_gap_multiplier
+        self.row_guides     = list(row_guides)
 
         if layout_mode not in VALID_LAYOUT_MODES:
             log.warning(f"Invalid layout_mode '{layout_mode}' — defaulting to 'horizontal'.")
@@ -117,6 +119,8 @@ class AutoMapper:
         self._next_id: int     = 0
         self._frame_count      = 0
         self._slots: dict      = {}
+        self._best_frame_bytes: bytes | None = None
+        self._best_frame_conf:  float        = 0.0
 
         if os.path.exists(slot_config_path):
             self._load_config()
@@ -134,8 +138,18 @@ class AutoMapper:
         log.info(f"AutoMapper layout_mode changed to '{mode}'")
 
     # ------------------------------------------------------------------
-    def feed_frame(self, vehicle_boxes: list, frame_shape: tuple):
+    def get_best_frame(self) -> bytes | None:
+        """Return JPEG bytes of the frame with the highest average detection confidence."""
+        return self._best_frame_bytes
+
+    def feed_frame(self, vehicle_boxes: list, frame_shape: tuple,
+                   frame_bytes: bytes = None, confidences: list = None):
         self._frame_count += 1
+        if frame_bytes is not None and confidences:
+            avg_conf = sum(confidences) / len(confidences)
+            if avg_conf > self._best_frame_conf:
+                self._best_frame_conf  = avg_conf
+                self._best_frame_bytes = frame_bytes
 
         current = []
         for box in vehicle_boxes:
@@ -493,6 +507,10 @@ class AutoMapper:
 
     # ------------------------------------------------------------------
     def _infer_row(self, y_center, frame_height):
+        if self.row_guides:
+            sorted_guides = sorted(self.row_guides)
+            idx = min(range(len(sorted_guides)), key=lambda i: abs(y_center - sorted_guides[i]))
+            return chr(ord("A") + idx)
         r = y_center / frame_height
         return "A" if r < 0.33 else ("B" if r < 0.66 else "C")
 

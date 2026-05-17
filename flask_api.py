@@ -1,6 +1,6 @@
 """
 flask_api.py — REST API on Raspberry Pi
-Unified entry point: one RTSP connection, one YOLO model, one process.
+Unified entry point: one camera source, one YOLO model, one process.
 
 Architecture:
   - A background daemon thread runs the full detection + Firebase sync loop
@@ -11,6 +11,13 @@ Architecture:
   - main.py is no longer needed — just run: python3 flask_api.py
 """
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
+import base64
 import cv2
 import json
 import time
@@ -23,34 +30,50 @@ from collections import deque
 from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
 from ultralytics import YOLO
+from firebase_admin import db
 from firebase_sync import FirebaseSync
 from auto_mapper import AutoMapper
+from ai_slot_gen import generate_filled_lot, generate_filled_lot_nb, extract_slots_from_ai_frame
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 log = logging.getLogger(__name__)
+logging.getLogger("werkzeug").setLevel(logging.ERROR)
 
 app = Flask(__name__)
 CORS(app)
 
 # ── Config ────────────────────────────────────────────────────────────────────
+# RTSP_URL — live IP camera stream.
+# VIDEO_SOURCE is set to RTSP_URL by default so the grabber connects on startup.
+# To use a video file instead, upload via POST /video/load then POST /video/start.
+# When the video file is stopped or unloaded, the grabber falls back to RTSP.
 RTSP_URL       = "rtsp://admin:Skibidi1@192.168.1.142:554/Streaming/Channels/101"
-FIREBASE_URL   = "https://automapping-parking-slot-default-rtdb.asia-southeast1.firebasedatabase.app"
-CREDENTIALS    = "serviceAccountKey.json"
+VIDEO_SOURCE   = RTSP_URL
+
+# Firebase is optional. Set FIREBASE_ENABLED = True and supply valid
+# CREDENTIALS + FIREBASE_URL to push occupancy data to the cloud.
+FIREBASE_ENABLED        = True
+FIREBASE_URL            = "https://automapping-parking-slot-default-rtdb.asia-southeast1.firebasedatabase.app"
+CREDENTIALS             = "serviceAccountKey.json"
+# Firebase Storage bucket — required only for AI slot generation via Nano Banana Pro.
+# Find this in Firebase Console → Storage → bucket name (e.g. "your-project-id.appspot.com").
+FIREBASE_STORAGE_BUCKET = "automapping-parking-slot.firebasestorage.app"
+
+# Pi identity — must be unique per physical Pi and URL-safe.
+# Must match an entry in /map_pins/ created via the web admin Pins tab.
+LOCAL_PIN_CODE = "GLEPARK"
+FLASK_PORT     = 5000
 SLOT_CONFIG    = "slot_config.json"
 CONFIDENCE     = 0.20
-TARGET_CLASSES = [0]          # custom model: car
-IOU_THRESHOLD  = 0.35
+TARGET_CLASSES = [0,1,2]          # custom model: car, cone, stand
+IOU_THRESHOLD  = 0.50
 SMOOTHING_WIN  = 5            # frames for majority-vote smoothing
 DETECT_INTERVAL = 1.0         # seconds between detection cycles
 FIREBASE_EVERY  = 2           # push Firebase every N detection cycles
 MAPPER_EPS_PX   = 40          # DBSCAN eps pixels — lower separates close-parked cars better
-
-FIREBASE_ENABLED      = True          # set False to disable Firebase entirely
-FIREBASE_PARKING_PATH = "parking"     # Pi uses "parking" (production path)
-VIDEO_SOURCE          = RTSP_URL      # keep as RTSP_URL on Pi
 
 # Fisheye undistortion — values are live-fetched from Firebase every 5s.
 # These are only the startup fallback defaults used before Firebase responds.
@@ -61,28 +84,27 @@ ZOOM        = 0.7
 # How often the bg thread checks Firebase for undistort config changes (seconds)
 UNDISTORT_POLL_INTERVAL = 5
 
-# Force TCP transport and suppress H.264/RTSP decoder noise.
-# These must be set before any VideoCapture call.
+# Force TCP transport for RTSP only — not needed for webcam/file sources.
+# Must be set before any VideoCapture call.
 _using_rtsp = isinstance(VIDEO_SOURCE, str) and VIDEO_SOURCE.lower().startswith("rtsp://")
 if _using_rtsp:
     os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
         "rtsp_transport;tcp"
-        "|stimeout;5000000"
+        "|stimeout;5000000"           # 5 s TCP socket timeout — keeps retries short
         "|fflags;nobuffer"
         "|flags;low_delay"
         "|max_delay;0"
         "|reorder_queue_size;0"
-        "|analyzeduration;1000000"   # 1 s — faster stream open
+        "|analyzeduration;1000000"
         "|probesize;1000000"
     )
-# Suppress noisy H.264/FFmpeg log spam on stderr (Pi logs fill up fast)
 os.environ["OPENCV_LOG_LEVEL"]        = "ERROR"
 os.environ["OPENCV_FFMPEG_LOGLEVEL"]  = "8"   # AV_LOG_FATAL only
 
 # ── Load YOLO once — shared by bg thread and /analyze-image ──────────────────
 # Fix #1: YOLO inference is NOT thread-safe. Guard every model() call with
 # this lock so the bg detection thread and /analyze-image never run together.
-log.info("Loading YOLOv8n model...")
+log.info("Loading custom model...")
 model      = YOLO("best.pt")
 _yolo_lock = threading.Lock()
 log.info("Model ready.")
@@ -103,6 +125,23 @@ _last_fb_push     = 0
 _remap_requested  = False
 _remap_layout_mode = "auto"       # mode requested by the last /remap call —
                                    # applied by the bg thread when it resets the mapper
+_row_guides: list = []             # Y pixel values (camera coords) set by /remap; empty = auto
+
+# Reserve-spot and parked-car constants
+RESERVE_GUIDE_TOL_PX   = 80    # class 1/2 must be within this many px of a row guide to get a slot
+PARK_FRAMES_THRESHOLD  = 240   # frames (~4 min at 1 FPS) a class-0 car must be still to auto-create slot
+RESERVE_STABLE_SECS = 240       # wall-clock seconds a class 1/2 must be stationary before creating a slot
+_parked_watcher:  dict = {}    # grid-key -> {cx, cy, box, still_count}
+_reserve_watcher: dict = {}    # grid-key -> {cx, cy, box, still_count, cls_id}
+
+# ── AI-gen slot discovery state ───────────────────────────────────────────────
+_ai_phase          = "idle"    # "idle" | "generating" | "review" | "error"
+_ai_proposed_slots = {}        # proposed slots pending admin review
+_ai_generated_image: bytes | None = None   # JPEG bytes of the AI-generated frame
+_ai_error_msg      = ""
+
+# ── Auto-mapper instance — set by the background thread, read by route handlers ─
+mapper = None
 
 # ── Shared undistort state — hot-reloaded from Firebase ──────────────────────
 _undistort_cfg = {
@@ -115,11 +154,18 @@ _undistort_cfg = {
 # ── Shared program config — hot-reloaded from Firebase ───────────────────────
 _prog_cfg = {
     "confidence":      CONFIDENCE,
+    "conf_cls0":       0.20,   # per-class confidence floor — cars
+    "conf_cls1":       0.60,   # per-class confidence floor — traffic cones
+    "conf_cls2":       0.60,   # per-class confidence floor — reserve stands
     "iou_threshold":   IOU_THRESHOLD,
     "smoothing_win":   SMOOTHING_WIN,
     "detect_interval": DETECT_INTERVAL,
     "firebase_every":  FIREBASE_EVERY,
     "yolo_every_n":    1,
+    "max_reserve_box_area":  0,   # 0 = disabled; set e.g. 8000 to reject person-sized boxes for class 1/2
+    "nano_banana_api_key":   os.getenv("NANO_BANANA_API_KEY", ""),  # primary AI provider
+    "gemini_api_key":        os.getenv("GEMINI_API_KEY", ""),       # fallback provider
+    "ai_prompt":             "",  # custom prompt for either provider (empty = use default)
 }
 
 # ── Load existing slot config if present ─────────────────────────────────────
@@ -128,6 +174,103 @@ if os.path.exists(SLOT_CONFIG):
         _slots = json.load(f)
     log.info(f"Loaded {len(_slots)} slots from {SLOT_CONFIG}")
     _mapping_phase = False
+
+
+# ── Pi identity + Firebase registration ──────────────────────────────────────
+
+def get_zerotier_ip() -> str | None:
+    """
+    Return the IPv4 address of the active ZeroTier network, or None.
+    Tries the ZeroTier local API first (works on Windows/Mac/Linux),
+    then falls back to scanning for a zt* interface (Linux/Pi only).
+    """
+    import os, urllib.request, json as _json
+
+    # ZeroTier local API — cross-platform, most reliable.
+    # Works on Windows where ZeroTier adapters are GUID-named (not zt*).
+    token_paths = [
+        r"C:\ProgramData\ZeroTier\One\authtoken.secret",          # Windows
+        "/var/lib/zerotier-one/authtoken.secret",                  # Linux / Pi
+        os.path.expanduser("~/Library/Application Support/"
+                           "ZeroTier/One/authtoken.secret"),       # macOS
+    ]
+    for p in token_paths:
+        try:
+            with open(p) as f:
+                token = f.read().strip()
+            req = urllib.request.Request(
+                "http://localhost:9993/network",
+                headers={"X-ZT1-Auth": token},
+            )
+            with urllib.request.urlopen(req, timeout=2) as resp:
+                networks = _json.loads(resp.read())
+            for net in networks:
+                for addr in net.get("assignedAddresses", []):
+                    ip = addr.split("/")[0]
+                    if ":" not in ip:   # IPv4 only
+                        return ip
+        except OSError:
+            continue   # token file not found on this OS — try next path
+        except Exception:
+            break       # found token but API call failed
+
+    # zt* interface scan — Linux / Pi fallback if local API unavailable
+    try:
+        import netifaces
+        for iface in netifaces.interfaces():
+            if iface.startswith("zt"):
+                addrs = netifaces.ifaddresses(iface).get(netifaces.AF_INET, [])
+                if addrs:
+                    return addrs[0]["addr"]
+    except ImportError:
+        log.warning("netifaces not installed — run: pip install netifaces")
+
+    return None
+
+
+def resolve_pin_code() -> str:
+    """
+    Check /pi_config/active_pin in Firebase for a manual override.
+    Falls back to LOCAL_PIN_CODE if none is set.
+    """
+    try:
+        manual = db.reference("/pi_config/active_pin").get()
+        if manual and isinstance(manual, str):
+            log.info(f"Manual pin override active: {manual}")
+            return manual
+    except Exception as e:
+        log.warning(f"Could not read pi_config/active_pin: {e}")
+    return LOCAL_PIN_CODE
+
+
+def register_pi() -> None:
+    """Write Pi metadata to /pi_registry/{LOCAL_PIN_CODE} in Firebase."""
+    zt_ip = get_zerotier_ip()
+    if not zt_ip:
+        log.warning("ZeroTier not connected — skipping Pi registration")
+        return
+    try:
+        active_pin = resolve_pin_code()
+        db.reference(f"/pi_registry/{LOCAL_PIN_CODE}").update({
+            "pinCode":       LOCAL_PIN_CODE,
+            "activePinCode": active_pin,
+            "apiUrl":        f"http://{zt_ip}:{FLASK_PORT}",
+            "ztIp":          zt_ip,
+            "lastSeen":      int(time.time() * 1000),
+        })
+        log.debug(f"Registered as {LOCAL_PIN_CODE} → {zt_ip}:{FLASK_PORT} (active pin: {active_pin})")
+    except Exception as e:
+        log.warning(f"Pi registration failed: {e}")
+
+
+def _heartbeat_loop() -> None:
+    """Update lastSeen and ZeroTier IP in Firebase every 15 seconds."""
+    while True:
+        time.sleep(15)
+        try:
+            register_pi()
+        except Exception as e:
+            log.warning(f"Heartbeat failed: {e}")
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -146,7 +289,7 @@ def _check_overlap(vbox, slot_coords) -> bool:
     Rect uses IoU overlap with the configurable iou_threshold.
     """
     cx = (vbox[0] + vbox[2]) / 2
-    cy = (vbox[1] + vbox[3]) / 2
+    cy = vbox[1] + (vbox[3] - vbox[1]) * 0.75  # bottom-biased: tires are at base of bbox
 
     if _is_quad(slot_coords):
         contour = np.array(slot_coords, dtype=np.float32)
@@ -176,9 +319,12 @@ def _apply_smoothing(statuses: dict) -> dict:
             _smoothing_hist[slot_id] = deque(
                 list(_smoothing_hist[slot_id])[-win:], maxlen=win
             )
-        _smoothing_hist[slot_id].append(1 if status == "Occupied" else 0)
-        majority = sum(_smoothing_hist[slot_id]) > (win // 2)
-        statuses[slot_id] = "Occupied" if majority else "Vacant"
+        _STATUS_NUM = {"Occupied": 1, "Reserved": 2, "Vacant": 0}
+        _smoothing_hist[slot_id].append(_STATUS_NUM.get(status, 0))
+        hist = list(_smoothing_hist[slot_id])
+        counts = [hist.count(0), hist.count(1), hist.count(2)]
+        winner = counts.index(max(counts))
+        statuses[slot_id] = ["Vacant", "Occupied", "Reserved"][winner]
     return statuses
 
 
@@ -189,9 +335,11 @@ def _draw_boxes(frame, vehicle_boxes, slot_results=None):
             coords = slot.get("coords")
             if not coords:
                 continue
-            occ   = slot["status"] == "Occupied"
-            color = (60, 60, 220) if occ else (80, 200, 120)
-            label = f"{slot['id']} {'OCC' if occ else 'VAC'}"
+            occ = slot["status"] == "Occupied"
+            res = slot["status"] == "Reserved"
+            # BGR: occupied=red, reserved=orange(22,115,249), vacant=green
+            color = (60, 60, 220) if occ else ((22, 115, 249) if res else (80, 200, 120))
+            label = f"{slot['id']} {'OCC' if occ else ('RES' if res else 'VAC')}"
 
             if _is_quad(coords):
                 pts = np.array(coords, dtype=np.int32)
@@ -212,13 +360,38 @@ def _draw_boxes(frame, vehicle_boxes, slot_results=None):
                     (x1 + 4, y2 - 8),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 189, 56), 1, cv2.LINE_AA)
 
-    occupied = sum(1 for s in (slot_results or []) if s["status"] == "Occupied")
-    total    = len(slot_results) if slot_results else 0
-    cv2.rectangle(frame, (0, 0), (520, 44), (7, 10, 16), -1)
+    occupied     = sum(1 for s in (slot_results or []) if s["status"] == "Occupied")
+    reserved     = sum(1 for s in (slot_results or []) if s["status"] == "Reserved")
+    total        = len(slot_results) if slot_results else 0
+    car_count    = sum(1 for vb in vehicle_boxes if vb.get("cls_id", 0) == 0)
+    marker_count = len(vehicle_boxes) - car_count
+    cv2.rectangle(frame, (0, 0), (700, 44), (7, 10, 16), -1)
     cv2.putText(frame,
-                f"YOLOv8n  |  {len(vehicle_boxes)} vehicles  |  {occupied}/{total} slots occupied",
-                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
+                f"YOLOv8n  |  {car_count} cars  {marker_count} markers  |  {occupied} occ  {reserved} res  / {total} slots",
+                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2, cv2.LINE_AA)
     return frame
+
+
+# ── Row / occupancy helpers ───────────────────────────────────────────────────
+
+def _infer_row_from_y(cy: float, frame_h: float) -> str:
+    """Return row letter A/B/C based on vertical thirds of the frame."""
+    r = cy / max(frame_h, 1)
+    return "A" if r < 0.33 else ("B" if r < 0.66 else "C")
+
+
+def _row_label_for_y(cy: float, guides: list) -> str:
+    """
+    Return a row letter for a detected object given the current row guides.
+    If guides are defined, return the letter of the nearest guide (A, B, C …).
+    Falls back to _infer_row_from_y if no guides.
+    """
+    if not guides:
+        return "A"   # will be re-labelled once frame height is known
+    sorted_guides = sorted(guides)
+    idx = min(range(len(sorted_guides)),
+              key=lambda i: abs(cy - sorted_guides[i]))
+    return chr(ord("A") + idx)
 
 
 # ── Camera grabber — single shared RTSP session ──────────────────────────────
@@ -261,38 +434,57 @@ _vid_fps    = 25.0       # native FPS of loaded video
 
 def _open_capture(retries: int = 5, delay: float = 3.0):
     """
-    Open a fresh RTSP VideoCapture with low-latency settings.
+    Open a VideoCapture for any source: local webcam, video file, or RTSP stream.
     Returns the open VideoCapture, or None after exhausting retries.
+    Returns None early if a video file becomes ready to play during RTSP retries.
     """
+    src_label = (
+        f"webcam {VIDEO_SOURCE}" if isinstance(VIDEO_SOURCE, int)
+        else ("RTSP stream" if _using_rtsp else f"file {VIDEO_SOURCE}")
+    )
     for attempt in range(1, retries + 1):
-        log.info(f"[CAM] Opening RTSP stream (attempt {attempt}/{retries})...")
-        cap = cv2.VideoCapture(RTSP_URL, cv2.CAP_FFMPEG)
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        cap.set(cv2.CAP_PROP_FOURCC,     cv2.VideoWriter_fourcc(*"H264"))
-        cap.set(cv2.CAP_PROP_FPS,        15)
+        # If a video file was loaded (regardless of play state), bail so the
+        # grabber can switch to video mode without waiting for this RTSP attempt.
+        with _vid_lock:
+            if _vid_path is not None:
+                log.info("[CAM] Video file loaded — aborting RTSP retry.")
+                return None
+        log.info(f"[CAM] Opening {src_label} (attempt {attempt}/{retries})...")
+        if _using_rtsp:
+            cap = cv2.VideoCapture(VIDEO_SOURCE, cv2.CAP_FFMPEG)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            cap.set(cv2.CAP_PROP_FOURCC,     cv2.VideoWriter_fourcc(*"H264"))
+            cap.set(cv2.CAP_PROP_FPS,        15)
+        else:
+            cap = cv2.VideoCapture(VIDEO_SOURCE)
         if cap.isOpened():
-            # Warm-up: read and discard a few frames so the decoder is stable
-            for _ in range(4):
-                cap.grab()
-            log.info("[CAM] Stream opened successfully.")
+            if _using_rtsp:
+                for _ in range(4):
+                    cap.grab()
+            log.info(f"[CAM] {src_label} opened successfully.")
             return cap
         cap.release()
         log.warning(f"[CAM] Attempt {attempt} failed — retrying in {delay}s...")
-        time.sleep(delay)
-    log.error(f"[CAM] Could not open RTSP stream after {retries} attempts.")
+        # Sleep in short increments so a video-load request is noticed quickly.
+        deadline = time.monotonic() + delay
+        while time.monotonic() < deadline:
+            with _vid_lock:
+                if _vid_path is not None:
+                    log.info("[CAM] Video file loaded — aborting RTSP retry.")
+                    return None
+            time.sleep(0.1)
+    log.error(f"[CAM] Could not open {src_label} after {retries} attempts.")
     return None
 
 
 def _grabber_loop():
     """
-    Sole owner of all VideoCapture instances. Handles two modes:
+    Sole owner of all VideoCapture instances. Two modes:
       - Video file: reads the loaded file at its native FPS; supports
-        play / pause / stop commands via _vid_* globals.
-      - Live source (RTSP / webcam): continuously decodes at native FPS
-        so the H.264 decoder stays warm and reference frames don't evict.
-
-    Both modes publish frames to the same _grabber_frame shared state so
-    the detection loop and MJPEG stream loop don't care which source is active.
+        play / pause / stop via _vid_* globals.
+      - Live source (webcam / RTSP): continuously decodes so the decoder
+        stays warm. Falls back here whenever no video file is playing.
+    Both modes publish to the same _grabber_frame shared state.
     """
     global _grabber_frame, _grabber_frame_ts, _grabber_alive
     global _vid_frame, _vid_state
@@ -311,13 +503,14 @@ def _grabber_loop():
             vid_fps   = _vid_fps
             vid_total = _vid_total
 
-        # Pi repo: idle if no video is loaded and not using RTSP (e.g. local dev).
-        if vid_path is None and not RTSP_URL.startswith("rtsp://"):
+        # Desktop/webcam mode: idle until user explicitly loads a video file.
+        # Without this guard the grabber opens webcam 0, feeds blank frames to
+        # the detection loop, and the mapper runs forever with 0 vehicles.
+        if vid_path is None and isinstance(VIDEO_SOURCE, int) and not _using_rtsp:
             time.sleep(0.1)
             continue
 
         if vid_path is not None and vid_state == "playing":
-            # Release live cap while video is active
             if live_cap is not None:
                 try: live_cap.release()
                 except Exception: pass
@@ -325,7 +518,6 @@ def _grabber_loop():
                 decode_fail_count    = 0
                 decode_streak_logged = False
 
-            # Open (or reuse) the video capture
             if vid_cap is None or not vid_cap.isOpened():
                 vid_cap = cv2.VideoCapture(vid_path)
 
@@ -339,7 +531,6 @@ def _grabber_loop():
                     _grabber_alive    = True
                 time.sleep(1.0 / max(vid_fps, 1))
             else:
-                # End of file — auto-stop
                 log.info("[VID] Playback finished.")
                 with _vid_lock:
                     _vid_state = "stopped"
@@ -350,7 +541,6 @@ def _grabber_loop():
             continue
 
         if vid_path is not None and vid_state == "paused":
-            # Keep last frame visible; release live cap
             if live_cap is not None:
                 try: live_cap.release()
                 except Exception: pass
@@ -359,25 +549,26 @@ def _grabber_loop():
             continue
 
         if vid_path is not None and vid_state == "stopped":
-            # Release video cap and fall through to live source
             if vid_cap is not None:
                 try: vid_cap.release()
                 except Exception: pass
                 vid_cap = None
-            # If no live source configured, just idle
-            if RTSP_URL.startswith("rtsp://") and "YOUR" not in RTSP_URL:
-                pass  # fall through to live source below
-            else:
+            if not _using_rtsp and isinstance(VIDEO_SOURCE, int):
                 time.sleep(0.1)
                 continue
 
-        # ── Live source mode (RTSP / webcam) ─────────────────────────────────
+        # ── Live source mode (webcam / RTSP) ─────────────────────────────────
         if vid_cap is not None:
             try: vid_cap.release()
             except Exception: pass
             vid_cap = None
 
         if live_cap is None or not live_cap.isOpened():
+            # Skip RTSP entirely if a video file is already loaded.
+            with _vid_lock:
+                if _vid_path is not None:
+                    time.sleep(0.1)
+                    continue
             live_cap = _open_capture()
             if live_cap is None:
                 time.sleep(2.0)
@@ -398,7 +589,6 @@ def _grabber_loop():
                 _grabber_alive    = True
             continue
 
-        # Decode failed
         decode_fail_count += 1
         if not decode_streak_logged:
             decode_streak_logged = True
@@ -459,32 +649,40 @@ def _detection_loop():
     Owns: camera, YOLO inference, auto-mapper, Firebase sync, smoothing.
     Writes results into shared state for Flask routes to read.
     """
-    global _latest_frame, _latest_raw_frame, _latest_statuses, _latest_vehicle_boxes, _latest_slot_results, _slots, _mapping_phase, _frame_count, _last_fb_push, firebase_instance, _remap_requested, _remap_layout_mode
+    global _latest_frame, _latest_raw_frame, _latest_statuses, _latest_vehicle_boxes, _latest_slot_results, _slots, _mapping_phase, _frame_count, _last_fb_push, firebase_instance, _remap_requested, _remap_layout_mode, mapper
 
     # ── Firebase ──────────────────────────────────────────────────────────────
     firebase = None
     if FIREBASE_ENABLED:
-        try:
-            firebase = FirebaseSync(
-                credentials_path=CREDENTIALS,
-                database_url=FIREBASE_URL,
-                parking_path=FIREBASE_PARKING_PATH,
-            )
-            firebase_instance = firebase
-        except Exception as e:
-            log.error(f"[FB] Firebase init failed — occupancy won't be synced: {e}")
+        if firebase_instance is not None:
+            firebase = firebase_instance
+            log.info("[FB] Using pre-initialized Firebase instance.")
+        else:
+            try:
+                firebase = FirebaseSync(
+                    credentials_path=CREDENTIALS,
+                    database_url=FIREBASE_URL,
+                    pin_code=LOCAL_PIN_CODE,
+                    storage_bucket=FIREBASE_STORAGE_BUCKET,
+                )
+                firebase_instance = firebase
+            except Exception as e:
+                log.error(f"[FB] Firebase init failed — occupancy won't be synced: {e}")
     else:
         log.info("[FB] Firebase disabled — running in local-only mode.")
 
     # ── Auto-mapper ───────────────────────────────────────────────────────────
     with _state_lock:
         initial_mode = _remap_layout_mode
+    with _state_lock:
+        initial_guides = list(_row_guides)
     mapper = AutoMapper(
         slot_config_path=SLOT_CONFIG,
         min_frames_to_map=150,
         min_samples=3,
         eps_pixels=MAPPER_EPS_PX,
         layout_mode=initial_mode,
+        row_guides=initial_guides,
     )
     with _state_lock:
         mapping_phase = _mapping_phase
@@ -589,9 +787,12 @@ def _detection_loop():
                 mapper._frame_count  = 0
                 mapper._slots        = {}
                 mapper.set_layout_mode(requested_mode)
+                with _state_lock:
+                    mapper.row_guides = list(_row_guides)
                 local_frame_count    = 0
                 sample_saved         = False
                 with _state_lock:
+                    _slots         = {}   # ensure stale slots don't leak into occupancy push
                     _mapping_phase = True
                 log.info(f"[BG] Mapper reset in '{requested_mode}' mode. "
                          f"Starting fresh mapping phase (~150 frames)...")
@@ -656,7 +857,18 @@ def _detection_loop():
                             "coords":     [x1, y1, x2, y2],
                             "confidence": round(float(box.conf[0]), 3),
                             "label":      model.names[int(box.cls[0])],
+                            "cls_id":     int(box.cls[0]),
                         })
+                # Apply per-class confidence thresholds (filter after global floor)
+                _cls_confs = {
+                    0: _prog_cfg.get("conf_cls0", 0.20),
+                    1: _prog_cfg.get("conf_cls1", 0.45),
+                    2: _prog_cfg.get("conf_cls2", 0.45),
+                }
+                vehicle_boxes = [
+                    vb for vb in vehicle_boxes
+                    if vb["confidence"] >= _cls_confs.get(vb["cls_id"], _prog_cfg.get("confidence", 0.20))
+                ]
                 last_yolo_frame = vehicle_boxes
             else:
                 vehicle_boxes = last_yolo_frame or []
@@ -666,14 +878,19 @@ def _detection_loop():
 
             # ── Phase 1: Auto-Mapping ─────────────────────────────────────────
             if mapping_phase:
-                mapper.feed_frame(
-                    [[v["coords"][0], v["coords"][1], v["coords"][2], v["coords"][3]]
-                     for v in vehicle_boxes],
-                    frame.shape,
-                )
+                # Only cluster class-0 cars; cones/stands are handled separately
+                car_boxes_for_mapper = [
+                    [v["coords"][0], v["coords"][1], v["coords"][2], v["coords"][3]]
+                    for v in vehicle_boxes if v.get("cls_id", 0) == 0
+                ]
+                car_confs = [v["confidence"] for v in vehicle_boxes if v.get("cls_id", 0) == 0]
+                _, _frame_jpeg = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                mapper.feed_frame(car_boxes_for_mapper, frame.shape,
+                                  frame_bytes=bytes(_frame_jpeg), confidences=car_confs)
 
-                if local_frame_count % 10 == 0:
-                    log.info(f"[BG] Mapping... frame {local_frame_count}/150 | vehicles: {len(vehicle_boxes)}")
+                if local_frame_count % 30 == 0:
+                    car_count = sum(1 for vb in vehicle_boxes if vb.get("cls_id", 0) == 0)
+                    log.info(f"[BG] Mapping... frame {local_frame_count}/150 | cars: {car_count}")
 
                 if mapper.is_mapping_complete():
                     discovered = mapper.get_slots()
@@ -683,6 +900,7 @@ def _detection_loop():
                     log.info(f"[BG] Auto-mapping complete — {len(discovered)} slots discovered.")
                     if firebase:
                         firebase.push_slot_layout(discovered)
+                        firebase.reset_slots({sid: "Vacant" for sid in discovered})
 
                 local_frame_count += 1
                 time.sleep(detect_interval)
@@ -696,8 +914,13 @@ def _detection_loop():
             slot_results = []
             for slot_id, slot_data in current_slots.items():
                 coords = slot_data["coords"]
-                is_occ = any(_check_overlap(vb["coords"], coords) for vb in vehicle_boxes)
-                statuses[slot_id] = "Occupied" if is_occ else "Vacant"
+                occ_vb = next((vb for vb in vehicle_boxes if _check_overlap(vb["coords"], coords)), None)
+                if occ_vb is None:
+                    statuses[slot_id] = "Vacant"
+                elif occ_vb.get("cls_id", 0) in (1, 2):
+                    statuses[slot_id] = "Reserved"
+                else:
+                    statuses[slot_id] = "Occupied"
                 slot_results.append({
                     "id":     slot_id,
                     "status": statuses[slot_id],
@@ -711,6 +934,102 @@ def _detection_loop():
             for sr in slot_results:
                 sr["status"] = statuses[sr["id"]]
 
+            # ── Reserve-object stability watcher (class 1 & 2 near row guides) ────
+            # Uses wall-clock time so fast detection loops / yolo_every_n reuse
+            # cannot inflate the count. Walking person resets first_seen every
+            # ~20 px of movement; a stationary cone accumulates real seconds.
+            now = time.time()
+            with _state_lock:
+                guides         = list(_row_guides)
+                cur_slots_snap = dict(_slots)
+            frame_h = frame.shape[0]
+            new_reserve_watcher: dict = {}
+            for vb in vehicle_boxes:
+                if vb.get("cls_id", 0) not in (1, 2):
+                    continue
+                with _state_lock:
+                    max_area = _prog_cfg.get("max_reserve_box_area", 0)
+                if max_area > 0:
+                    _x1, _y1, _x2, _y2 = vb["coords"]
+                    if (_x2 - _x1) * (_y2 - _y1) > max_area:
+                        continue
+                cx = (vb["coords"][0] + vb["coords"][2]) / 2
+                cy = (vb["coords"][1] + vb["coords"][3]) / 2
+                near_guide = (not guides) or any(abs(cy - gy) < RESERVE_GUIDE_TOL_PX for gy in guides)
+                if not near_guide:
+                    continue
+                key  = f"{int(cx // 20)}_{int(cy // 20)}"
+                prev = _reserve_watcher.get(key)
+                if prev and np.hypot(cx - prev["cx"], cy - prev["cy"]) < 20:
+                    first_seen = prev["first_seen"]   # still in same spot — keep original timestamp
+                else:
+                    first_seen = now                  # moved or brand-new — reset clock
+                new_reserve_watcher[key] = {
+                    "cx": cx, "cy": cy, "box": vb["coords"],
+                    "cls_id": vb["cls_id"], "first_seen": first_seen,
+                }
+                if now - first_seen < RESERVE_STABLE_SECS:
+                    continue
+                already = any(_check_overlap(vb["coords"], s["coords"]) for s in cur_slots_snap.values())
+                if already:
+                    continue
+                x1r, y1r, x2r, y2r = [int(c) for c in vb["coords"]]
+                with _state_lock:
+                    r_count = sum(1 for k in _slots if k.startswith('R'))
+                    new_id = f"R{r_count + 1:02d}"
+                    if new_id not in _slots:
+                        quad = [[x1r,y1r],[x2r,y1r],[x2r,y2r],[x1r,y2r]]
+                        _slots[new_id] = {
+                            "coords": quad,
+                            "row":    _row_label_for_y(cy, guides) if guides else _infer_row_from_y(cy, frame_h),
+                            "source": "reserve",
+                        }
+                        cur_slots_snap = dict(_slots)
+                        with open(SLOT_CONFIG, "w") as f:
+                            json.dump(dict(_slots), f, indent=2)
+                        if firebase:
+                            firebase.push_slot_layout(dict(_slots))
+                        log.info(f"[BG] Reserve slot {new_id} created at ({int(cx)},{int(cy)}) after {now-first_seen:.1f}s stationary.")
+            _reserve_watcher.clear()
+            _reserve_watcher.update(new_reserve_watcher)
+
+            # ── Parked-car watcher (class 0 stationary ≥ PARK_FRAMES_THRESHOLD) ─
+            new_watcher: dict = {}
+            for vb in vehicle_boxes:
+                if vb.get("cls_id", 0) != 0:
+                    continue
+                cx = (vb["coords"][0] + vb["coords"][2]) / 2
+                cy = (vb["coords"][1] + vb["coords"][3]) / 2
+                key  = f"{int(cx // 20)}_{int(cy // 20)}"
+                prev = _parked_watcher.get(key)
+                if prev and np.hypot(cx - prev["cx"], cy - prev["cy"]) < 20:
+                    still = prev["still_count"] + 1
+                else:
+                    still = 1
+                new_watcher[key] = {"cx": cx, "cy": cy, "box": vb["coords"], "still_count": still}
+                if still >= PARK_FRAMES_THRESHOLD:
+                    with _state_lock:
+                        already = any(_check_overlap(vb["coords"], s["coords"]) for s in _slots.values())
+                    if not already:
+                        x1p, y1p, x2p, y2p = [int(c) for c in vb["coords"]]
+                        with _state_lock:
+                            p_count = sum(1 for k in _slots if k.startswith('P'))
+                            new_id = f"P{p_count + 1:02d}"
+                            if new_id not in _slots:
+                                quad = [[x1p,y1p],[x2p,y1p],[x2p,y2p],[x1p,y2p]]
+                                _slots[new_id] = {
+                                    "coords": quad,
+                                    "row":    _row_label_for_y(cy, guides) if guides else _infer_row_from_y(cy, frame_h),
+                                    "source": "parked",
+                                }
+                                with open(SLOT_CONFIG, "w") as f:
+                                    json.dump(dict(_slots), f, indent=2)
+                                if firebase:
+                                    firebase.push_slot_layout(dict(_slots))
+                                log.info(f"[BG] Auto-created parked-car slot {new_id} at ({int(cx)},{int(cy)}) after {still}s still.")
+            _parked_watcher.clear()
+            _parked_watcher.update(new_watcher)
+
             # Write shared state — stream thread handles frame annotation + encoding
             with _state_lock:
                 _latest_vehicle_boxes = list(vehicle_boxes)
@@ -722,14 +1041,18 @@ def _detection_loop():
             if firebase and local_frame_count % max(1, firebase_every) == 0:
                 firebase.push_occupancy(statuses)
 
-            occupied = sum(1 for s in statuses.values() if s == "Occupied")
-            log.info(
-                f"[BG] Frame {local_frame_count} | "
-                f"Occupied: {occupied}/{len(statuses)} | "
-                f"Vehicles: {len(vehicle_boxes)} | "
-                f"conf={conf} iou={_prog_cfg['iou_threshold']} "
-                f"interval={detect_interval}s yolo_every={yolo_every_n}"
-            )
+            occupied     = sum(1 for s in statuses.values() if s == "Occupied")
+            reserved     = sum(1 for s in statuses.values() if s == "Reserved")
+            car_count    = sum(1 for vb in vehicle_boxes if vb.get("cls_id", 0) == 0)
+            marker_count = len(vehicle_boxes) - car_count
+            if local_frame_count % 30 == 0:
+                log.info(
+                    f"[BG] Frame {local_frame_count} | "
+                    f"Occ: {occupied}  Res: {reserved}  / {len(statuses)} | "
+                    f"Cars: {car_count}  Markers: {marker_count} | "
+                    f"conf={conf} iou={_prog_cfg['iou_threshold']} "
+                    f"interval={detect_interval}s yolo_every={yolo_every_n}"
+                )
 
             local_frame_count += 1
             time.sleep(detect_interval)
@@ -886,7 +1209,7 @@ def status():
         "slots_loaded":  slots_loaded,
         "mapping_phase": mapping,
         "frame_count":   frame_count,
-        "model":         "best",
+        "model":         "yolov8n",
         "mapper_eps_px": MAPPER_EPS_PX,
         "timestamp":     int(time.time() * 1000),
     })
@@ -995,9 +1318,16 @@ def analyze_image():
 
     h, w = frame.shape[:2]
     with _state_lock:
-        live_conf = _prog_cfg["confidence"]   # Fix #10: use live admin-set confidence
-    with _yolo_lock:                          # Fix #1: guard shared model
+        live_conf  = _prog_cfg["confidence"]
+        _cls_confs = {
+            0: _prog_cfg.get("conf_cls0", 0.20),
+            1: _prog_cfg.get("conf_cls1", 0.45),
+            2: _prog_cfg.get("conf_cls2", 0.45),
+        }
+    with _yolo_lock:
         results = model(frame, conf=live_conf, classes=TARGET_CLASSES, verbose=False)
+
+    # Build vehicle_boxes identically to the live detection loop (includes cls_id)
     vehicle_boxes = []
     for r in results:
         for box in r.boxes:
@@ -1006,59 +1336,79 @@ def analyze_image():
                 "coords":     [round(x1), round(y1), round(x2), round(y2)],
                 "confidence": round(float(box.conf[0]), 3),
                 "label":      model.names[int(box.cls[0])],
+                "cls_id":     int(box.cls[0]),
             })
+    # Apply per-class confidence floors (same as live detection)
+    vehicle_boxes = [
+        vb for vb in vehicle_boxes
+        if vb["confidence"] >= _cls_confs.get(vb["cls_id"], live_conf)
+    ]
 
     with _state_lock:
         current_slots = dict(_slots)
 
+    def _annotated_b64(frm, vboxes, slot_res):
+        annotated = _draw_boxes(frm.copy(), vboxes, slot_res)
+        _, buf = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        return "data:image/jpeg;base64," + base64.b64encode(buf).decode()
+
     if not current_slots:
         estimated = []
         for i, vb in enumerate(vehicle_boxes):
+            # class 1/2 (traffic cone / reserve stand) → Reserved
+            status = "Reserved" if vb["cls_id"] in (1, 2) else "Occupied"
             estimated.append({
                 "id":         f"S{i+1:02d}",
-                "status":     "Occupied",
+                "status":     status,
                 "confidence": vb["confidence"],
                 "coords":     vb["coords"],
                 "row":        "A" if vb["coords"][1] < h // 3 else ("B" if vb["coords"][1] < 2 * h // 3 else "C"),
             })
+        occupied = sum(1 for s in estimated if s["status"] == "Occupied")
+        reserved = sum(1 for s in estimated if s["status"] == "Reserved")
         return jsonify({
             "mode": "no_slot_config", "image_size": [w, h],
             "vehicles_detected": len(vehicle_boxes), "vehicle_boxes": vehicle_boxes,
             "slots": estimated, "total_slots": len(estimated),
-            "occupied": len(estimated), "vacant": 0,
+            "occupied": occupied, "reserved": reserved, "vacant": 0,
+            "annotated_image": _annotated_b64(frame, vehicle_boxes, estimated),
             "timestamp": int(time.time() * 1000),
         })
 
     slot_results   = []
     occupied_count = 0
+    reserved_count = 0
     for slot_id, slot_data in current_slots.items():
-        coords = slot_data["coords"]
-        # Fix #2: single pass — find the first overlapping vehicle box (if any)
-        # previously _check_overlap was called twice per slot (once for is_occ,
-        # once again inside next() for confidence) — wasteful point-in-polygon work.
+        coords     = slot_data["coords"]
         matched_vb = next(
             (vb for vb in vehicle_boxes if _check_overlap(vb["coords"], coords)),
             None,
         )
-        is_occ = matched_vb is not None
-        conf   = matched_vb["confidence"] if is_occ else round(0.88 + (hash(slot_id) % 10) * 0.01, 3)
-        if is_occ:
+        if matched_vb is None:
+            status = "Vacant"
+        elif matched_vb["cls_id"] in (1, 2):
+            status = "Reserved"
+            reserved_count += 1
+        else:
+            status = "Occupied"
             occupied_count += 1
+        conf = matched_vb["confidence"] if matched_vb else round(0.88 + (hash(slot_id) % 10) * 0.01, 3)
         slot_results.append({
             "id":         slot_id,
-            "status":     "Occupied" if is_occ else "Vacant",
+            "status":     status,
             "confidence": round(conf, 3),
             "row":        slot_data.get("row", "A"),
-            "coords":     coords,
+            "coords":     slot_data["coords"],
         })
 
-    vacant_count = len(current_slots) - occupied_count
+    vacant_count = len(current_slots) - occupied_count - reserved_count
     return jsonify({
         "mode": "slot_config", "image_size": [w, h],
         "vehicles_detected": len(vehicle_boxes), "vehicle_boxes": vehicle_boxes,
         "slots": slot_results, "total_slots": len(current_slots),
-        "occupied": occupied_count, "vacant": vacant_count,
+        "occupied": occupied_count, "reserved": reserved_count, "vacant": vacant_count,
         "occupancy_percent": round((occupied_count / max(1, len(current_slots))) * 100),
+        "annotated_image": _annotated_b64(frame, vehicle_boxes, slot_results),
         "timestamp": int(time.time() * 1000),
     })
 
@@ -1081,12 +1431,16 @@ def set_program_config():
         current = dict(_prog_cfg)
 
     new_cfg = {
-        "confidence":      max(0.05, min(0.9,  float(data.get("confidence",      current["confidence"])))),
+        "confidence":      max(0.05, min(0.95, float(data.get("confidence",      current["confidence"])))),
+        "conf_cls0":       max(0.05, min(0.95, float(data.get("conf_cls0",       current.get("conf_cls0", 0.20))))),
+        "conf_cls1":       max(0.05, min(0.95, float(data.get("conf_cls1",       current.get("conf_cls1", 0.45))))),
+        "conf_cls2":       max(0.05, min(0.95, float(data.get("conf_cls2",       current.get("conf_cls2", 0.45))))),
         "iou_threshold":   max(0.1,  min(0.9,  float(data.get("iou_threshold",   current["iou_threshold"])))),
         "smoothing_win":   max(1,    min(30,   int(data.get("smoothing_win",     current["smoothing_win"])))),
         "detect_interval": max(0.0,  min(5.0,  float(data.get("detect_interval", current["detect_interval"])))),
         "firebase_every":  max(1,    min(30,   int(data.get("firebase_every",    current["firebase_every"])))),
         "yolo_every_n":    max(1,    min(10,   int(data.get("yolo_every_n",      current["yolo_every_n"])))),
+        "max_reserve_box_area": max(0, int(data.get("max_reserve_box_area", current.get("max_reserve_box_area", 0)))),
     }
 
     if firebase_instance:
@@ -1339,10 +1693,12 @@ def trigger_remap():
     Admin endpoint — signals the bg thread to reset the AutoMapper object
     and restart the mapping phase.
 
-    Body (optional JSON): { "layout_mode": "horizontal" | "vertical" | "grid" | "auto" }
-    Defaults to "auto" if omitted or invalid.
+    Body (optional JSON): {
+      "layout_mode": "horizontal" | "vertical" | "grid" | "auto",
+      "row_guides":  [y1, y2, ...]   # Y pixel values in camera coords; omit for auto
+    }
     """
-    global _remap_requested, _smoothing_hist, _remap_layout_mode
+    global _remap_requested, _smoothing_hist, _remap_layout_mode, _row_guides, _parked_watcher, _slots
 
     data = request.get_json(silent=True) or {}
     mode = str(data.get("layout_mode", "auto")).lower().strip()
@@ -1351,18 +1707,195 @@ def trigger_remap():
         log.warning(f"[ADMIN] /remap received invalid layout_mode='{mode}' — defaulting to 'auto'.")
         mode = "auto"
 
+    raw_guides = data.get("row_guides", [])
+    guides = [int(y) for y in raw_guides if isinstance(y, (int, float))] if isinstance(raw_guides, list) else []
+
     with _state_lock:
         _remap_requested   = True
         _remap_layout_mode = mode
-        _smoothing_hist.clear()   # .clear() mutates the real global dict
+        _smoothing_hist.clear()
+        _row_guides        = guides
+        _slots             = {}   # wipe in-memory slots so no stale push fires before BG thread resets
+    _parked_watcher.clear()
+    _reserve_watcher.clear()
     if os.path.exists(SLOT_CONFIG):
         os.remove(SLOT_CONFIG)
-    log.info(f"[ADMIN] Remap requested (mode={mode}) — bg thread will reset mapper on next frame.")
+    # Clear Firebase immediately so the map goes blank during remapping
+    if firebase_instance:
+        firebase_instance.clear_slots_and_layout()
+    log.info(f"[ADMIN] Remap requested (mode={mode}, guides={guides}) — bg thread will reset mapper on next frame.")
     return jsonify({
         "status":      "remap_started",
         "layout_mode": mode,
-        "message":     f"Auto-mapping restarted in '{mode}' mode.",
+        "row_guides":  guides,
+        "message":     f"Auto-mapping restarted in '{mode}' mode with {len(guides)} row guide(s).",
     })
+
+
+# ── AI-Gen Slot Discovery endpoints ──────────────────────────────────────────
+
+@app.route("/ai-mapping/best-frame", methods=["GET"])
+def ai_best_frame():
+    """Return the highest-confidence frame captured during the last mapping session."""
+    if mapper is None:
+        return jsonify({"error": "Mapper not ready — camera thread has not started."}), 503
+    frame_bytes = mapper.get_best_frame()
+    if frame_bytes is None:
+        return jsonify({"error": "No best frame available — run a mapping session first."}), 404
+    return frame_bytes, 200, {"Content-Type": "image/jpeg"}
+
+
+@app.route("/ai-mapping/status", methods=["GET"])
+def ai_mapping_status():
+    global _ai_phase, _ai_proposed_slots, _ai_error_msg
+    with _state_lock:
+        return jsonify({
+            "phase":               _ai_phase,
+            "proposed_slot_count": len(_ai_proposed_slots),
+            "error":               _ai_error_msg,
+        })
+
+
+@app.route("/ai-mapping/generate", methods=["POST"])
+def ai_mapping_generate():
+    """
+    Trigger AI slot generation:
+      1. Grab the best frame from the mapper.
+      2. Send it to the AI provider (Nano Banana Pro preferred, Gemini fallback)
+         to generate a filled-parking-lot image.
+      3. Run YOLO on the result to extract slot quads.
+    Body (optional JSON): { "nb_api_key": "...", "gemini_api_key": "...", "prompt": "..." }
+    Keys fall back to _prog_cfg values if omitted.
+    """
+    global _ai_phase, _ai_proposed_slots, _ai_generated_image, _ai_error_msg
+
+    if mapper is None:
+        return jsonify({"error": "Mapper not ready — camera thread has not started."}), 503
+    frame_bytes = mapper.get_best_frame()
+    if frame_bytes is None:
+        return jsonify({"error": "No best frame captured yet — complete a mapping session first."}), 400
+
+    data           = request.get_json(silent=True) or {}
+    nb_key         = data.get("nb_api_key")    or _prog_cfg.get("nano_banana_api_key", "")
+    gemini_key     = data.get("gemini_api_key") or _prog_cfg.get("gemini_api_key", "")
+    prompt         = data.get("prompt")         or _prog_cfg.get("ai_prompt", "")
+    cone_boxes_snap = list(_latest_vehicle_boxes)  # snapshot for pre-processing
+
+    if not nb_key and not gemini_key:
+        return jsonify({"error": "No AI key set — add nano_banana_api_key or gemini_api_key in Firebase config."}), 400
+
+    with _state_lock:
+        if _ai_phase == "generating":
+            return jsonify({"status": "generating", "message": "Already generating — please wait."})
+        _ai_phase     = "generating"
+        _ai_error_msg = ""
+
+    def _generate_thread():
+        global _ai_phase, _ai_proposed_slots, _ai_generated_image, _ai_error_msg
+        blob_name = None
+        try:
+            cone_boxes = [
+                list(map(int, vb["coords"]))
+                for vb in cone_boxes_snap if vb.get("cls_id", 0) in (1, 2)
+            ]
+            if nb_key:
+                # Nano Banana Pro — needs a public URL; upload frame to Firebase Storage first
+                frame_url, blob_name = firebase_instance.upload_temp_frame(frame_bytes)
+                try:
+                    generated = generate_filled_lot_nb(frame_url, nb_key, prompt or None)
+                except Exception as nb_exc:
+                    log.warning(f"[AI/NB] NB Pro failed ({nb_exc}); falling back to Gemini.")
+                    if not gemini_key:
+                        raise
+                    generated = generate_filled_lot(frame_bytes, gemini_key, prompt or None,
+                                                    cone_boxes=cone_boxes)
+            else:
+                # Gemini only
+                generated = generate_filled_lot(frame_bytes, gemini_key, prompt or None,
+                                                cone_boxes=cone_boxes)
+
+            with _state_lock:
+                current_slot_ids = set(_slots.keys())
+                live_conf        = _prog_cfg["confidence"]
+
+            with _yolo_lock:  # Fix #1: YOLO not thread-safe — guard shared model
+                proposed = extract_slots_from_ai_frame(generated, model, live_conf, current_slot_ids,
+                                                        cam_frame_bytes=frame_bytes)
+            log.info(f"[AI] Extraction complete — {len(proposed)} proposed slots")
+
+            with _state_lock:
+                _ai_generated_image = generated
+                _ai_proposed_slots  = proposed
+                _ai_phase           = "review"
+        except Exception as exc:
+            log.error(f"[AI] Generation failed: {exc}")
+            with _state_lock:
+                _ai_phase     = "error"
+                _ai_error_msg = str(exc)
+        finally:
+            if blob_name and firebase_instance:
+                firebase_instance.delete_temp_frame(blob_name)
+
+    threading.Thread(target=_generate_thread, daemon=True).start()
+    return jsonify({"status": "generating"})
+
+
+@app.route("/ai-mapping/generated-image", methods=["GET"])
+def ai_generated_image_endpoint():
+    """Return the AI-generated filled-parking-lot image for UI preview."""
+    with _state_lock:
+        img = _ai_generated_image
+    if img is None:
+        return jsonify({"error": "No generated image available."}), 404
+    return img, 200, {"Content-Type": "image/jpeg"}
+
+
+@app.route("/ai-mapping/proposed-slots", methods=["GET"])
+def ai_proposed_slots_endpoint():
+    """Return the AI-proposed slots (pending admin review)."""
+    with _state_lock:
+        return jsonify(_ai_proposed_slots)
+
+
+@app.route("/ai-mapping/confirm", methods=["POST"])
+def ai_mapping_confirm():
+    """
+    Merge AI-proposed slots into the active slot set, persist to disk and Firebase.
+    Clears the AI generation state and switches to live occupancy mode.
+    """
+    global _slots, _mapping_phase, _ai_phase, _ai_proposed_slots, _ai_generated_image
+
+    with _state_lock:
+        if not _ai_proposed_slots:
+            return jsonify({"error": "No proposed slots to confirm."}), 400
+        merged = dict(_ai_proposed_slots)   # AI slots replace DBSCAN slots entirely
+        _slots              = merged
+        _mapping_phase      = False
+        _ai_phase           = "idle"
+        proposed_copy       = dict(_ai_proposed_slots)
+        _ai_proposed_slots  = {}
+        _ai_generated_image = None
+
+    with open(SLOT_CONFIG, "w") as f:
+        json.dump(merged, f, indent=2)
+    if firebase_instance:
+        firebase_instance.push_slot_layout(merged)
+        firebase_instance.reset_slots({sid: "Vacant" for sid in merged})
+
+    log.info(f"[AI] Confirmed {len(proposed_copy)} AI-generated slots — replaced DBSCAN slots.")
+    return jsonify({"saved": len(proposed_copy), "total": len(merged)})
+
+
+@app.route("/ai-mapping/reject", methods=["POST"])
+def ai_mapping_reject():
+    """Discard AI-proposed slots and return to idle (regular mapping slots are kept)."""
+    global _ai_phase, _ai_proposed_slots, _ai_generated_image
+    with _state_lock:
+        _ai_phase           = "idle"
+        _ai_proposed_slots  = {}
+        _ai_generated_image = None
+    log.info("[AI] Admin rejected AI-proposed slots.")
+    return jsonify({"status": "rejected"})
 
 
 @app.route("/slots", methods=["POST"])
@@ -1458,7 +1991,6 @@ def delete_slot(slot_id):
 def video_load():
     """Accept an uploaded video file and prepare it for playback."""
     global _vid_path, _vid_state, _vid_frame, _vid_total, _vid_fps
-    log.info(f"[VID] /video/load — content_type={request.content_type!r} files={list(request.files.keys())} form={list(request.form.keys())}")
     f = request.files.get("video")
     if not f:
         return jsonify({"error": "no file uploaded"}), 400
@@ -1466,11 +1998,7 @@ def video_load():
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=ext)
     f.save(tmp.name)
     tmp.close()
-    cap = cv2.VideoCapture(tmp.name)
-    if not cap.isOpened():
-        cap.release()
-        os.unlink(tmp.name)
-        return jsonify({"error": "OpenCV could not open the video file — FFMPEG support may be missing on this device"}), 422
+    cap   = cv2.VideoCapture(tmp.name)
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     fps   = cap.get(cv2.CAP_PROP_FPS) or 25.0
     cap.release()
@@ -1522,49 +2050,76 @@ def video_stop():
 
 @app.route("/video/unload", methods=["POST"])
 def video_unload():
-    """Delete the loaded temp file and resume live source."""
-    global _vid_path, _vid_state, _vid_frame, _vid_total, _vid_fps
+    """Unload the video file and return to live RTSP stream."""
+    global _vid_path, _vid_state, _vid_frame
     with _vid_lock:
-        path       = _vid_path
+        if _vid_path and os.path.exists(_vid_path):
+            try:
+                os.unlink(_vid_path)
+            except Exception:
+                pass
         _vid_path  = None
         _vid_state = "stopped"
         _vid_frame = 0
-        _vid_total = 0
-        _vid_fps   = 25.0
-    if path and os.path.exists(path):
-        try:
-            os.unlink(path)
-        except Exception:
-            pass
-    log.info("[VID] Video unloaded; resuming live source.")
-    return jsonify({"status": "unloaded"})
+    log.info("[VID] Video unloaded — reverting to RTSP stream.")
+    return jsonify({"status": "unloaded", "source": "rtsp", "rtsp_url": RTSP_URL})
 
 
 @app.route("/video/status", methods=["GET"])
 def video_status():
-    """Return current video playback state."""
+    """Return current video playback state and active source."""
     with _vid_lock:
+        path  = _vid_path
         state = _vid_state
         frame = _vid_frame
         total = _vid_total
         fps   = _vid_fps
-        path  = _vid_path
-    source = "video" if (path and state in ("playing", "paused")) else "rtsp"
+    active_source = "file" if path is not None else "rtsp"
     return jsonify({
-        "state":  state,
-        "frame":  frame,
-        "total":  total,
-        "fps":    round(fps, 1),
-        "source": source,
+        "state":        state,
+        "frame":        frame,
+        "total":        total,
+        "fps":          round(fps, 1),
+        "source":       active_source,
+        "rtsp_url":     RTSP_URL,
     })
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    print("\n=== Smart Parking Flask API (unified) ===")
-    print(f"RTSP  : {RTSP_URL}")
-    print(f"API   : http://<PI_IP>:5000")
+    print("\n=== Smart Parking Flask API (Raspberry Pi) ===")
+    print(f"Pi ID       : {LOCAL_PIN_CODE}")
+    print(f"Live source : {RTSP_URL}")
+    print(f"Video file  : POST /video/load  →  POST /video/start")
+    print(f"Switch back : POST /video/stop  or  POST /video/unload")
+    print(f"API         : http://<PI_ZT_IP>:{FLASK_PORT}")
     print("Routes: /status  /slots  /occupancy  /live-frame  /analyze-image  /remap")
     print("        /slots/<id> PUT/DELETE  /program-config  /undistort-config")
+    print("        /video/load  /video/start  /video/pause  /video/stop  /video/unload  /video/status")
+    print("        /ai-mapping/best-frame  /ai-mapping/generate  /ai-mapping/confirm  /ai-mapping/reject")
     print("=========================================\n")
-    app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)
+
+    if FIREBASE_ENABLED:
+        import firebase_admin
+        from firebase_admin import credentials as _fb_creds
+        try:
+            _cred = _fb_creds.Certificate(CREDENTIALS)
+            _fb_options = {"databaseURL": FIREBASE_URL}
+            if FIREBASE_STORAGE_BUCKET:
+                _fb_options["storageBucket"] = FIREBASE_STORAGE_BUCKET
+            firebase_admin.initialize_app(_cred, _fb_options)
+        except ValueError:
+            pass  # Already initialized by the background detection thread
+
+        active_pin = resolve_pin_code()
+        firebase_instance = FirebaseSync(
+            credentials_path=CREDENTIALS,
+            database_url=FIREBASE_URL,
+            pin_code=active_pin,
+            storage_bucket=FIREBASE_STORAGE_BUCKET,
+        )
+
+        register_pi()
+        threading.Thread(target=_heartbeat_loop, daemon=True).start()
+
+    app.run(host="0.0.0.0", port=FLASK_PORT, debug=False, threaded=True)
