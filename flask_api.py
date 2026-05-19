@@ -558,12 +558,13 @@ _grabber_alive     = False  # True once we have produced at least one frame
 _grabber_stop      = False  # set True to ask the grabber to exit (not used yet)
 
 # ── Video file playback state ─────────────────────────────────────────────────
-_vid_lock   = threading.Lock()
-_vid_path   = None       # path to loaded temp file, or None
-_vid_state  = "stopped"  # "stopped" | "playing" | "paused"
-_vid_frame  = 0          # current frame index
-_vid_total  = 0          # total frames in loaded video
-_vid_fps    = 25.0       # native FPS of loaded video
+_vid_lock    = threading.Lock()
+_vid_path    = None       # path to loaded temp file, or None
+_vid_state   = "stopped"  # "stopped" | "playing" | "paused"
+_vid_frame   = 0          # current frame index
+_vid_total   = 0          # total frames in loaded video
+_vid_fps     = 25.0       # native FPS of loaded video
+_vid_seek_to = None       # target frame for pending seek, or None
 
 
 def _open_capture(retries: int = 5, delay: float = 3.0):
@@ -621,7 +622,7 @@ def _grabber_loop():
     Both modes publish to the same _grabber_frame shared state.
     """
     global _grabber_frame, _grabber_frame_ts, _grabber_alive
-    global _vid_frame, _vid_state
+    global _vid_frame, _vid_state, _vid_seek_to
 
     live_cap              = None
     vid_cap               = None
@@ -655,6 +656,15 @@ def _grabber_loop():
             if vid_cap is None or not vid_cap.isOpened():
                 vid_cap = cv2.VideoCapture(vid_path)
 
+            # Handle pending seek request
+            with _vid_lock:
+                seek_to = _vid_seek_to
+                if seek_to is not None:
+                    _vid_seek_to = None
+                    _vid_frame   = seek_to
+            if seek_to is not None and vid_cap is not None and vid_cap.isOpened():
+                vid_cap.set(cv2.CAP_PROP_POS_FRAMES, seek_to)
+
             ret, frame = vid_cap.read()
             if ret and frame is not None:
                 with _vid_lock:
@@ -679,6 +689,23 @@ def _grabber_loop():
                 try: live_cap.release()
                 except Exception: pass
                 live_cap = None
+            # Handle pending seek request while paused
+            with _vid_lock:
+                seek_to  = _vid_seek_to
+                cur_path = _vid_path
+                if seek_to is not None:
+                    _vid_seek_to = None
+                    _vid_frame   = seek_to
+            if seek_to is not None and cur_path:
+                if vid_cap is None or not vid_cap.isOpened():
+                    vid_cap = cv2.VideoCapture(cur_path)
+                vid_cap.set(cv2.CAP_PROP_POS_FRAMES, seek_to)
+                ret, frame = vid_cap.read()
+                if ret and frame is not None:
+                    with _grabber_lock:
+                        _grabber_frame    = frame
+                        _grabber_frame_ts = time.monotonic()
+                        _grabber_alive    = True
             time.sleep(0.05)
             continue
 
@@ -2380,6 +2407,27 @@ def video_pause():
         _vid_state = "paused"
     log.info("[VID] Playback paused.")
     return jsonify({"status": "paused"})
+
+
+@app.route("/video/seek", methods=["POST"])
+def video_seek():
+    """Seek to a frame. Pauses playback if not already playing; resume with /video/start."""
+    global _vid_seek_to, _vid_state
+    data  = request.get_json(force=True, silent=True) or {}
+    frame = data.get("frame")
+    try:
+        frame = int(frame)
+    except (TypeError, ValueError):
+        return jsonify({"error": "frame (int) required"}), 400
+    with _vid_lock:
+        if not _vid_path:
+            return jsonify({"error": "no video loaded"}), 400
+        frame = max(0, min(frame, _vid_total - 1))
+        _vid_seek_to = frame
+        if _vid_state != "playing":
+            _vid_state = "paused"
+    log.info(f"[VID] Seek requested → frame {frame}")
+    return jsonify({"status": "seeking", "frame": frame})
 
 
 @app.route("/video/stop", methods=["POST"])
