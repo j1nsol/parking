@@ -65,8 +65,11 @@ FIREBASE_STORAGE_BUCKET = "automapping-parking-slot.firebasestorage.app"   # ←
 
 # Pi identity — must be unique per physical Pi and URL-safe.
 # Must match an entry in /map_pins/ created via the web admin Pins tab.
-LOCAL_PIN_CODE = "GLEPARK"
-FLASK_PORT     = 5000
+LOCAL_PIN_CODE  = "GLEPARK"
+FLASK_PORT      = 5000
+UPLOAD_TMP_DIR  = "/home/admin/parking/tmp"   # on main disk, not tmpfs /tmp
+os.makedirs(UPLOAD_TMP_DIR, exist_ok=True)
+tempfile.tempdir = UPLOAD_TMP_DIR
 SLOT_CONFIG    = f"{LOCAL_PIN_CODE}_slot_config.json"
 GUIDE_CONFIG   = f"{LOCAL_PIN_CODE}_row_guides.json"
 CONFIDENCE     = 0.20
@@ -2311,32 +2314,50 @@ def delete_slot(slot_id):
 
 
 # ── Video file playback endpoints ─────────────────────────────────────────────
+VIDEO_STORE_DIR = os.path.join(UPLOAD_TMP_DIR, "videos")
+os.makedirs(VIDEO_STORE_DIR, exist_ok=True)
+
 @app.route("/video/load", methods=["POST"])
 def video_load():
-    """Accept an uploaded video file and prepare it for playback."""
+    """Accept an uploaded video file and prepare it for playback.
+
+    If a file with the same name and byte size already exists on disk it is
+    reused immediately without re-writing, saving upload time on repeat loads.
+    """
     global _vid_path, _vid_state, _vid_frame, _vid_total, _vid_fps
     f = request.files.get("video")
     if not f:
         return jsonify({"error": "no file uploaded"}), 400
-    ext = os.path.splitext(f.filename or "video.mp4")[1] or ".mp4"
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=ext)
-    f.save(tmp.name)
-    tmp.close()
-    cap   = cv2.VideoCapture(tmp.name)
+
+    filename    = os.path.basename(f.filename or "video.mp4")
+    dest        = os.path.join(VIDEO_STORE_DIR, filename)
+    upload_size = request.content_length  # byte size from Content-Length header
+
+    cached = (
+        os.path.exists(dest)
+        and upload_size
+        and os.path.getsize(dest) == upload_size
+    )
+
+    if cached:
+        log.info(f"[VID] Cache hit — reusing {filename} ({upload_size} bytes)")
+    else:
+        f.save(dest)
+        log.info(f"[VID] Saved {filename} → {dest}")
+
+    cap   = cv2.VideoCapture(dest)
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     fps   = cap.get(cv2.CAP_PROP_FPS) or 25.0
     cap.release()
+
     with _vid_lock:
-        if _vid_path and os.path.exists(_vid_path):
-            try: os.unlink(_vid_path)
-            except Exception: pass
-        _vid_path  = tmp.name
+        _vid_path  = dest
         _vid_state = "stopped"
         _vid_frame = 0
         _vid_total = total
         _vid_fps   = fps
-    log.info(f"[VID] Loaded {f.filename} — {total} frames @ {fps:.1f} FPS")
-    return jsonify({"status": "loaded", "total": total, "fps": round(fps, 1)})
+
+    return jsonify({"status": "loaded", "cached": cached, "total": total, "fps": round(fps, 1)})
 
 
 @app.route("/video/start", methods=["POST"])
