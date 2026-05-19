@@ -30,12 +30,24 @@ Layout modes:
 
 import cv2
 import json
+import math
 import os
 import numpy as np
 import logging
 from sklearn.cluster import DBSCAN
 
 log = logging.getLogger(__name__)
+
+
+def _perp_dist_to_segment(px, py, x1, y1, x2, y2):
+    """Returns (distance, t) where t∈[0,1] is parametric position on segment."""
+    dx, dy = x2 - x1, y2 - y1
+    length_sq = dx*dx + dy*dy
+    if length_sq == 0:
+        return math.hypot(px - x1, py - y1), 0.5
+    t = max(0.0, min(1.0, ((px - x1)*dx + (py - y1)*dy) / length_sq))
+    return math.hypot(px - (x1 + t*dx), py - (y1 + t*dy)), t
+
 
 STATIONARY_THRESHOLD_PX = 12   # was 20 — lowered so slightly wobbling cars (e.g. dark/toy cars)
                                 # still count as stationary and accumulate cluster detections.
@@ -81,6 +93,27 @@ def quad_from_bbox(x1, y1, x2, y2) -> list:
     """Fallback: convert axis-aligned bbox to quad."""
     return [[int(x1), int(y1)], [int(x2), int(y1)],
             [int(x2), int(y2)], [int(x1), int(y2)]]
+
+
+def renumber_slots_by_position(slots: dict) -> dict:
+    """
+    Reassign ALL slots as S## ordered left→right within each row, A→B→C top-to-bottom.
+    Call this any time a slot is added or removed so names always reflect physical layout.
+    """
+    def _cx(coords):
+        if not coords:
+            return 0
+        if isinstance(coords[0], (list, tuple)):
+            return sum(p[0] for p in coords) / len(coords)
+        return (coords[0] + coords[2]) / 2
+
+    sorted_slots = sorted(
+        slots.items(),
+        key=lambda kv: (kv[1].get("row", "Z"), _cx(kv[1].get("coords")))
+    )
+    renamed = {f"S{idx:02d}": data for idx, (_, data) in enumerate(sorted_slots, start=1)}
+    log.info(f"Slots renumbered by position: {list(renamed.keys())}")
+    return renamed
 
 
 class AutoMapper:
@@ -176,9 +209,12 @@ class AutoMapper:
                 new_tracked[best_id] = dict(cx=cx, cy=cy, x1=x1, y1=y1,
                                             x2=x2, y2=y2, still_count=still)
                 if still >= MIN_STATIONARY_FRAMES and still % ACCUM_EVERY == 0:
-                    self._detections.append((cx, cy, x1, y1, x2, y2))
-                    log.debug(f"[MAPPER] still id={best_id} ({round(cx)},{round(cy)}) "
-                              f"still={still} total={len(self._detections)}")
+                    if self._in_guide_range(cx, cy):
+                        self._detections.append((cx, cy, x1, y1, x2, y2))
+                        log.debug(f"[MAPPER] still id={best_id} ({round(cx)},{round(cy)}) "
+                                  f"still={still} total={len(self._detections)}")
+                    else:
+                        log.debug(f"[MAPPER] skipped id={best_id} ({round(cx)},{round(cy)}) — outside guide range")
             else:
                 new_tracked[self._next_id] = dict(cx=cx, cy=cy, x1=x1, y1=y1,
                                                   x2=x2, y2=y2, still_count=0)
@@ -225,7 +261,7 @@ class AutoMapper:
             sid = f"S{i+1:02d}"
             slots[sid] = {
                 "coords": quad,
-                "row":    self._infer_row(cy, frame_shape[0]),
+                "row":    self._infer_row(cx, cy, frame_shape[0]),
                 "source": "detected",
             }
             cluster_data.append((cx, cy, quad))
@@ -239,7 +275,7 @@ class AutoMapper:
                 log.info(f"Gap inference added {len(inferred)} empty slot(s) "
                          f"using mode='{self.layout_mode}'.")
 
-        self._slots = slots
+        self._slots = renumber_slots_by_position(slots)
         self._save_config()
 
     # ------------------------------------------------------------------
@@ -420,7 +456,7 @@ class AutoMapper:
                     sid = next_id()
                     inferred[sid] = {
                         "coords": final_quad,
-                        "row":    self._infer_row(mid_cy, frame_shape[0]),
+                        "row":    self._infer_row(mid_cx, mid_cy, frame_shape[0]),
                         "source": "inferred",
                     }
                     seen.append((mid_cx, mid_cy))
@@ -506,12 +542,49 @@ class AutoMapper:
         return sum(1 for g in groups if len(g) >= MIN_GROUP_SIZE_FOR_INFER)
 
     # ------------------------------------------------------------------
-    def _infer_row(self, y_center, frame_height):
+    @staticmethod
+    def _guide_mid_y(g):
+        """Extract midpoint Y from a guide entry for sorting (top-to-bottom row order)."""
+        if isinstance(g, dict):
+            if "y1" in g:
+                return (g["y1"] + g["y2"]) / 2
+            return g.get("y", 0)
+        return float(g)
+
+    @staticmethod
+    def _perp_dist(px, py, g):
+        """Return (distance, t) from point to guide segment."""
+        if isinstance(g, dict) and "y1" in g:
+            return _perp_dist_to_segment(px, py, g["x1"], g["y1"], g["x2"], g["y2"])
+        gy = g.get("y", 0) if isinstance(g, dict) else float(g)
+        return (abs(py - gy), 0.5)
+
+    def _in_guide_range(self, cx: float, cy: float) -> bool:
+        """
+        Return True if (cx, cy) projects within the extent of its nearest guide
+        segment (raw unclamped t ∈ [0,1]). Vehicles beyond the endpoints of all
+        guides are rejected. When no guides are set, always returns True.
+        """
+        if not self.row_guides:
+            return True
+        sorted_guides = sorted(self.row_guides, key=self._guide_mid_y)
+        nearest = min(sorted_guides, key=lambda g: self._perp_dist(cx, cy, g)[0])
+        if isinstance(nearest, dict) and "y1" in nearest:
+            dx = nearest["x2"] - nearest["x1"]
+            dy = nearest["y2"] - nearest["y1"]
+            length_sq = dx * dx + dy * dy
+            if length_sq > 0:
+                raw_t = ((cx - nearest["x1"]) * dx + (cy - nearest["y1"]) * dy) / length_sq
+                return 0.0 <= raw_t <= 1.0
+        return True  # legacy/zero-length guide — no extent check
+
+    def _infer_row(self, cx, cy, frame_height):
         if self.row_guides:
-            sorted_guides = sorted(self.row_guides)
-            idx = min(range(len(sorted_guides)), key=lambda i: abs(y_center - sorted_guides[i]))
+            sorted_guides = sorted(self.row_guides, key=self._guide_mid_y)
+            idx = min(range(len(sorted_guides)),
+                      key=lambda i: self._perp_dist(cx, cy, sorted_guides[i])[0])
             return chr(ord("A") + idx)
-        r = y_center / frame_height
+        r = cy / frame_height
         return "A" if r < 0.33 else ("B" if r < 0.66 else "C")
 
     def _save_config(self):
@@ -531,8 +604,10 @@ class AutoMapper:
 
     def add_slot_manual(self, slot_id, quad):
         self._slots[slot_id] = {"coords": quad, "row": "M", "source": "manual"}
+        self._slots = renumber_slots_by_position(self._slots)
         self._save_config()
 
     def remove_slot(self, slot_id):
         self._slots.pop(slot_id, None)
+        self._slots = renumber_slots_by_position(self._slots)
         self._save_config()

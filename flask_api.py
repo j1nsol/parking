@@ -20,6 +20,7 @@ except ImportError:
 import base64
 import cv2
 import json
+import math
 import time
 import os
 import tempfile
@@ -32,7 +33,7 @@ from flask_cors import CORS
 from ultralytics import YOLO
 from firebase_admin import db
 from firebase_sync import FirebaseSync
-from auto_mapper import AutoMapper
+from auto_mapper import AutoMapper, renumber_slots_by_position
 from ai_slot_gen import generate_filled_lot, generate_filled_lot_nb, extract_slots_from_ai_frame
 
 logging.basicConfig(
@@ -60,15 +61,16 @@ FIREBASE_URL            = "https://automapping-parking-slot-default-rtdb.asia-so
 CREDENTIALS             = "serviceAccountKey.json"
 # Firebase Storage bucket — required only for AI slot generation via Nano Banana Pro.
 # Find this in Firebase Console → Storage → bucket name (e.g. "your-project-id.appspot.com").
-FIREBASE_STORAGE_BUCKET = "automapping-parking-slot.firebasestorage.app"
+FIREBASE_STORAGE_BUCKET = "automapping-parking-slot.firebasestorage.app"   # ← fill in your bucket name to enable Nano Banana
 
 # Pi identity — must be unique per physical Pi and URL-safe.
 # Must match an entry in /map_pins/ created via the web admin Pins tab.
 LOCAL_PIN_CODE = "GLEPARK"
 FLASK_PORT     = 5000
-SLOT_CONFIG    = "slot_config.json"
+SLOT_CONFIG    = f"{LOCAL_PIN_CODE}_slot_config.json"
+GUIDE_CONFIG   = f"{LOCAL_PIN_CODE}_row_guides.json"
 CONFIDENCE     = 0.20
-TARGET_CLASSES = [0,1,2]          # custom model: car, cone, stand
+TARGET_CLASSES = [0,1,3]            # custom model: 0=car, 1=cone, 3=reserve (2=pwd skipped)
 IOU_THRESHOLD  = 0.50
 SMOOTHING_WIN  = 5            # frames for majority-vote smoothing
 DETECT_INTERVAL = 1.0         # seconds between detection cycles
@@ -120,19 +122,24 @@ _latest_slot_results  = []        # last slot occupancy results — read by stre
 _slots            = {}            # slot_id -> {coords, row, ...}
 _smoothing_hist   = {}            # slot_id -> deque for temporal smoothing
 _mapping_phase    = True          # True while auto-mapper is still running
+_overridden_slots: set = set()   # slot IDs currently in manual override — not overwritten by detection
 _frame_count      = 0
 _last_fb_push     = 0
 _remap_requested  = False
 _remap_layout_mode = "auto"       # mode requested by the last /remap call —
                                    # applied by the bg thread when it resets the mapper
-_row_guides: list = []             # Y pixel values (camera coords) set by /remap; empty = auto
+_row_guides: list = []             # [{y, x1, x2}] dicts (camera coords) set by /remap; empty = auto
 
 # Reserve-spot and parked-car constants
-RESERVE_GUIDE_TOL_PX   = 80    # class 1/2 must be within this many px of a row guide to get a slot
+RESERVE_GUIDE_TOL_PX   = 80    # class 1/3 must be within this many px of a row guide to get a slot
 PARK_FRAMES_THRESHOLD  = 240   # frames (~4 min at 1 FPS) a class-0 car must be still to auto-create slot
-RESERVE_STABLE_SECS = 240       # wall-clock seconds a class 1/2 must be stationary before creating a slot
+RESERVE_OVERRIDE_FRAMES = 180  # frames (~3 min at 1 FPS): car parked over a reserve slot rewrites its bbox
+RESERVE_STABLE_SECS    = 240   # wall-clock seconds a class 1/3 must be stationary before creating a slot
+MOVING_CAR_COOLDOWN_SECS = 4   # seconds before a drive-lane car becomes an active emoji on the driver UI
+MOVING_CAR_MATCH_PX      = 80  # px radius to match a detection to the same car across frames
 _parked_watcher:  dict = {}    # grid-key -> {cx, cy, box, still_count}
 _reserve_watcher: dict = {}    # grid-key -> {cx, cy, box, still_count, cls_id}
+_moving_watcher:  dict = {}    # grid-key -> {cx, cy, first_seen, last_seen} (drive-lane cars)
 
 # ── AI-gen slot discovery state ───────────────────────────────────────────────
 _ai_phase          = "idle"    # "idle" | "generating" | "review" | "error"
@@ -155,25 +162,52 @@ _undistort_cfg = {
 _prog_cfg = {
     "confidence":      CONFIDENCE,
     "conf_cls0":       0.20,   # per-class confidence floor — cars
-    "conf_cls1":       0.60,   # per-class confidence floor — traffic cones
-    "conf_cls2":       0.60,   # per-class confidence floor — reserve stands
+    "conf_cls1":       0.60,   # per-class confidence floor — cones
+    "conf_cls3":       0.60,   # per-class confidence floor — reserve (class 2=pwd not detected)
     "iou_threshold":   IOU_THRESHOLD,
     "smoothing_win":   SMOOTHING_WIN,
     "detect_interval": DETECT_INTERVAL,
     "firebase_every":  FIREBASE_EVERY,
     "yolo_every_n":    1,
-    "max_reserve_box_area":  0,   # 0 = disabled; set e.g. 8000 to reject person-sized boxes for class 1/2
+    "max_reserve_box_area":  0,   # 0 = disabled; set e.g. 8000 to reject person-sized boxes for class 1/3
     "nano_banana_api_key":   os.getenv("NANO_BANANA_API_KEY", ""),  # primary AI provider
     "gemini_api_key":        os.getenv("GEMINI_API_KEY", ""),       # fallback provider
     "ai_prompt":             "",  # custom prompt for either provider (empty = use default)
 }
 
 # ── Load existing slot config if present ─────────────────────────────────────
+# One-time migration: rename legacy slot_config.json to the pincode-scoped name.
+_legacy_config = "slot_config.json"
+if not os.path.exists(SLOT_CONFIG) and os.path.exists(_legacy_config):
+    os.rename(_legacy_config, SLOT_CONFIG)
+    log.info(f"Migrated {_legacy_config} → {SLOT_CONFIG}")
+
 if os.path.exists(SLOT_CONFIG):
     with open(SLOT_CONFIG) as f:
-        _slots = json.load(f)
-    log.info(f"Loaded {len(_slots)} slots from {SLOT_CONFIG}")
-    _mapping_phase = False
+        _raw = f.read().strip()
+    if _raw:
+        _slots = json.loads(_raw)
+        log.info(f"Loaded {len(_slots)} slots from {SLOT_CONFIG}")
+        _mapping_phase = False
+    else:
+        _slots = {}
+        with open(SLOT_CONFIG, "w") as f:
+            json.dump({}, f)
+        log.info(f"Slot config {SLOT_CONFIG} was empty — initialized to {{}}")
+else:
+    with open(SLOT_CONFIG, "w") as f:
+        json.dump({}, f)
+    log.info(f"Created empty slot config {SLOT_CONFIG}")
+
+if os.path.exists(GUIDE_CONFIG):
+    try:
+        with open(GUIDE_CONFIG) as f:
+            _loaded_guides = json.load(f)
+        if isinstance(_loaded_guides, list):
+            _row_guides = _loaded_guides
+            log.info(f"Loaded {len(_row_guides)} row guides from {GUIDE_CONFIG}")
+    except Exception as _e:
+        log.warning(f"Could not load {GUIDE_CONFIG}: {_e}")
 
 
 # ── Pi identity + Firebase registration ──────────────────────────────────────
@@ -244,13 +278,20 @@ def resolve_pin_code() -> str:
 
 
 def register_pi() -> None:
-    """Write Pi metadata to /pi_registry/{LOCAL_PIN_CODE} in Firebase."""
-    zt_ip = get_zerotier_ip()
-    if not zt_ip:
-        log.warning("ZeroTier not connected — skipping Pi registration")
-        return
+    """Update /pi_config/active_pins heartbeat and /pi_registry metadata in Firebase."""
+    # Always update active_pins regardless of ZeroTier connectivity
     try:
         active_pin = resolve_pin_code()
+        db.reference(f"/pi_config/active_pins/{active_pin}").set(int(time.time() * 1000))
+    except Exception as e:
+        log.warning(f"Failed to update active_pins heartbeat: {e}")
+        active_pin = LOCAL_PIN_CODE
+
+    zt_ip = get_zerotier_ip()
+    if not zt_ip:
+        log.warning("ZeroTier not connected — skipping Pi registry update")
+        return
+    try:
         db.reference(f"/pi_registry/{LOCAL_PIN_CODE}").update({
             "pinCode":       LOCAL_PIN_CODE,
             "activePinCode": active_pin,
@@ -263,14 +304,34 @@ def register_pi() -> None:
         log.warning(f"Pi registration failed: {e}")
 
 
+# Set to the resolved pin code on startup; used by _deregister_pi for cleanup.
+_current_active_pin = None
+
+
 def _heartbeat_loop() -> None:
-    """Update lastSeen and ZeroTier IP in Firebase every 15 seconds."""
+    """Update active_pins heartbeat and ZeroTier registry in Firebase every 15 seconds."""
     while True:
         time.sleep(15)
         try:
             register_pi()
         except Exception as e:
             log.warning(f"Heartbeat failed: {e}")
+
+
+def _deregister_pi() -> None:
+    """Remove this Pi from /pi_config/active_pins on clean shutdown."""
+    if not FIREBASE_ENABLED or not _current_active_pin:
+        return
+    try:
+        db.reference(f"/pi_config/active_pins/{_current_active_pin}").delete()
+        log.info(f"[shutdown] Removed {_current_active_pin} from active_pins")
+    except Exception:
+        pass  # best-effort cleanup
+    try:
+        if firebase_instance:
+            firebase_instance.clear_moving_cars()
+    except Exception:
+        pass
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -305,6 +366,18 @@ def _check_overlap(vbox, slot_coords) -> bool:
     with _state_lock:
         threshold = _prog_cfg["iou_threshold"]
     return (inter / slot_area) >= threshold
+
+
+def _find_overlapping_reserve_slot(vbox):
+    """Return (slot_id, slot) if vbox center falls inside a 'reserve' source slot, else None."""
+    with _state_lock:
+        snapshot = dict(_slots)
+    for sid, slot in snapshot.items():
+        if slot.get("source") != "reserve":
+            continue
+        if _check_overlap(vbox, slot["coords"]):
+            return sid, slot
+    return None
 
 
 def _apply_smoothing(statuses: dict) -> dict:
@@ -372,6 +445,44 @@ def _draw_boxes(frame, vehicle_boxes, slot_results=None):
     return frame
 
 
+# ── Geometry helpers ─────────────────────────────────────────────────────────
+
+def _perp_dist_to_segment(px: float, py: float,
+                           x1: float, y1: float, x2: float, y2: float):
+    """
+    Perpendicular distance from (px, py) to segment (x1,y1)-(x2,y2).
+    Returns (distance, t) where t ∈ [0,1] is the parametric position on the
+    segment at which the perpendicular foot lands.
+    """
+    dx, dy = x2 - x1, y2 - y1
+    length_sq = dx*dx + dy*dy
+    if length_sq == 0:
+        return math.hypot(px - x1, py - y1), 0.5
+    t = max(0.0, min(1.0, ((px - x1)*dx + (py - y1)*dy) / length_sq))
+    return math.hypot(px - (x1 + t*dx), py - (y1 + t*dy)), t
+
+
+def _guide_mid_y(g) -> float:
+    """Midpoint Y of a guide — used for top-to-bottom ordering (Row A, B, C …)."""
+    if isinstance(g, dict):
+        if "y1" in g:
+            return (g["y1"] + g["y2"]) / 2
+        return g.get("y", 0)
+    return float(g)
+
+
+def _point_within_guide_extent(px: float, py: float, g: dict) -> bool:
+    """Return True if (px,py) projects within the extent of guide g (raw t ∈ [0,1])."""
+    if not (isinstance(g, dict) and "y1" in g):
+        return True  # legacy horizontal guides — no extent check
+    dx, dy = g["x2"] - g["x1"], g["y2"] - g["y1"]
+    length_sq = dx * dx + dy * dy
+    if length_sq == 0:
+        return True
+    t = ((px - g["x1"]) * dx + (py - g["y1"]) * dy) / length_sq
+    return 0.0 <= t <= 1.0
+
+
 # ── Row / occupancy helpers ───────────────────────────────────────────────────
 
 def _infer_row_from_y(cy: float, frame_h: float) -> str:
@@ -380,18 +491,38 @@ def _infer_row_from_y(cy: float, frame_h: float) -> str:
     return "A" if r < 0.33 else ("B" if r < 0.66 else "C")
 
 
-def _row_label_for_y(cy: float, guides: list) -> str:
+def _row_label_for_point(cx: float, cy: float, guides: list) -> str:
     """
     Return a row letter for a detected object given the current row guides.
-    If guides are defined, return the letter of the nearest guide (A, B, C …).
-    Falls back to _infer_row_from_y if no guides.
+    Uses perpendicular distance to each guide segment for angled-guide support.
+    Guides are dicts {x1,y1,x2,y2} (new) or {y,x1,x2} / plain ints (legacy).
     """
     if not guides:
-        return "A"   # will be re-labelled once frame height is known
-    sorted_guides = sorted(guides)
-    idx = min(range(len(sorted_guides)),
-              key=lambda i: abs(cy - sorted_guides[i]))
-    return chr(ord("A") + idx)
+        return "A"
+    sorted_guides = sorted(guides, key=_guide_mid_y)
+    best_idx, best_dist = 0, float("inf")
+    for i, g in enumerate(sorted_guides):
+        if isinstance(g, dict) and "y1" in g:
+            d, _ = _perp_dist_to_segment(cx, cy, g["x1"], g["y1"], g["x2"], g["y2"])
+        else:
+            gy = g.get("y", 0) if isinstance(g, dict) else float(g)
+            d = abs(cy - gy)
+        if d < best_dist:
+            best_dist, best_idx = d, i
+    return chr(ord("A") + best_idx)
+
+
+# ── Slot renumber helper ──────────────────────────────────────────────────────
+
+def _renumber_and_persist():
+    """Renumber _slots by position, save to disk, and push layout to Firebase."""
+    global _slots
+    _slots = renumber_slots_by_position(_slots)
+    with open(SLOT_CONFIG, "w") as f:
+        json.dump(dict(_slots), f, indent=2)
+    if firebase_instance:
+        firebase_instance.push_slot_layout(dict(_slots))
+        firebase_instance.reset_slots({sid: "Vacant" for sid in _slots})
 
 
 # ── Camera grabber — single shared RTSP session ──────────────────────────────
@@ -649,7 +780,7 @@ def _detection_loop():
     Owns: camera, YOLO inference, auto-mapper, Firebase sync, smoothing.
     Writes results into shared state for Flask routes to read.
     """
-    global _latest_frame, _latest_raw_frame, _latest_statuses, _latest_vehicle_boxes, _latest_slot_results, _slots, _mapping_phase, _frame_count, _last_fb_push, firebase_instance, _remap_requested, _remap_layout_mode, mapper
+    global _latest_frame, _latest_raw_frame, _latest_statuses, _latest_vehicle_boxes, _latest_slot_results, _slots, _mapping_phase, _frame_count, _last_fb_push, firebase_instance, _remap_requested, _remap_layout_mode, mapper, _overridden_slots, _moving_watcher
 
     # ── Firebase ──────────────────────────────────────────────────────────────
     firebase = None
@@ -823,6 +954,13 @@ def _detection_loop():
                             _prog_cfg.update(new_prog)
                 except Exception as e:
                     log.warning(f"[BG] Program config poll failed: {e}")
+                # Overridden slots — respect web-app manual overrides
+                try:
+                    new_overridden = firebase.get_overridden_slots()
+                    with _state_lock:
+                        _overridden_slots = new_overridden
+                except Exception as e:
+                    log.warning(f"[BG] Overridden slots poll failed: {e}")
 
             # Read live program config values once per loop iteration
             with _state_lock:
@@ -863,7 +1001,7 @@ def _detection_loop():
                 _cls_confs = {
                     0: _prog_cfg.get("conf_cls0", 0.20),
                     1: _prog_cfg.get("conf_cls1", 0.45),
-                    2: _prog_cfg.get("conf_cls2", 0.45),
+                    3: _prog_cfg.get("conf_cls3", 0.60),
                 }
                 vehicle_boxes = [
                     vb for vb in vehicle_boxes
@@ -917,7 +1055,7 @@ def _detection_loop():
                 occ_vb = next((vb for vb in vehicle_boxes if _check_overlap(vb["coords"], coords)), None)
                 if occ_vb is None:
                     statuses[slot_id] = "Vacant"
-                elif occ_vb.get("cls_id", 0) in (1, 2):
+                elif occ_vb.get("cls_id", 0) in (1, 3):
                     statuses[slot_id] = "Reserved"
                 else:
                     statuses[slot_id] = "Occupied"
@@ -934,7 +1072,7 @@ def _detection_loop():
             for sr in slot_results:
                 sr["status"] = statuses[sr["id"]]
 
-            # ── Reserve-object stability watcher (class 1 & 2 near row guides) ────
+            # ── Reserve-object stability watcher (class 1 & 3 near row guides) ────
             # Uses wall-clock time so fast detection loops / yolo_every_n reuse
             # cannot inflate the count. Walking person resets first_seen every
             # ~20 px of movement; a stationary cone accumulates real seconds.
@@ -945,7 +1083,7 @@ def _detection_loop():
             frame_h = frame.shape[0]
             new_reserve_watcher: dict = {}
             for vb in vehicle_boxes:
-                if vb.get("cls_id", 0) not in (1, 2):
+                if vb.get("cls_id", 0) not in (1, 3):
                     continue
                 with _state_lock:
                     max_area = _prog_cfg.get("max_reserve_box_area", 0)
@@ -955,7 +1093,15 @@ def _detection_loop():
                         continue
                 cx = (vb["coords"][0] + vb["coords"][2]) / 2
                 cy = (vb["coords"][1] + vb["coords"][3]) / 2
-                near_guide = (not guides) or any(abs(cy - gy) < RESERVE_GUIDE_TOL_PX for gy in guides)
+                near_guide = (not guides) or any(
+                    (
+                        _perp_dist_to_segment(cx, cy, gy["x1"], gy["y1"], gy["x2"], gy["y2"])[0] < RESERVE_GUIDE_TOL_PX
+                        and _point_within_guide_extent(cx, cy, gy)
+                    )
+                    if (isinstance(gy, dict) and "y1" in gy)
+                    else abs(cy - (gy.get("y", 0) if isinstance(gy, dict) else gy)) < RESERVE_GUIDE_TOL_PX
+                    for gy in guides
+                )
                 if not near_guide:
                     continue
                 key  = f"{int(cx // 20)}_{int(cy // 20)}"
@@ -975,21 +1121,15 @@ def _detection_loop():
                     continue
                 x1r, y1r, x2r, y2r = [int(c) for c in vb["coords"]]
                 with _state_lock:
-                    r_count = sum(1 for k in _slots if k.startswith('R'))
-                    new_id = f"R{r_count + 1:02d}"
-                    if new_id not in _slots:
-                        quad = [[x1r,y1r],[x2r,y1r],[x2r,y2r],[x1r,y2r]]
-                        _slots[new_id] = {
-                            "coords": quad,
-                            "row":    _row_label_for_y(cy, guides) if guides else _infer_row_from_y(cy, frame_h),
-                            "source": "reserve",
-                        }
-                        cur_slots_snap = dict(_slots)
-                        with open(SLOT_CONFIG, "w") as f:
-                            json.dump(dict(_slots), f, indent=2)
-                        if firebase:
-                            firebase.push_slot_layout(dict(_slots))
-                        log.info(f"[BG] Reserve slot {new_id} created at ({int(cx)},{int(cy)}) after {now-first_seen:.1f}s stationary.")
+                    tmp_id = f"_tmp_{int(cx)}_{int(cy)}"
+                    _slots[tmp_id] = {
+                        "coords": [[x1r,y1r],[x2r,y1r],[x2r,y2r],[x1r,y2r]],
+                        "row":    _row_label_for_point(cx, cy, guides) if guides else _infer_row_from_y(cy, frame_h),
+                        "source": "reserve",
+                    }
+                    _renumber_and_persist()
+                    cur_slots_snap = dict(_slots)
+                log.info(f"[BG] Reserve slot created at ({int(cx)},{int(cy)}) after {now-first_seen:.1f}s stationary.")
             _reserve_watcher.clear()
             _reserve_watcher.update(new_reserve_watcher)
 
@@ -1013,22 +1153,73 @@ def _detection_loop():
                     if not already:
                         x1p, y1p, x2p, y2p = [int(c) for c in vb["coords"]]
                         with _state_lock:
-                            p_count = sum(1 for k in _slots if k.startswith('P'))
-                            new_id = f"P{p_count + 1:02d}"
-                            if new_id not in _slots:
-                                quad = [[x1p,y1p],[x2p,y1p],[x2p,y2p],[x1p,y2p]]
-                                _slots[new_id] = {
-                                    "coords": quad,
-                                    "row":    _row_label_for_y(cy, guides) if guides else _infer_row_from_y(cy, frame_h),
-                                    "source": "parked",
-                                }
-                                with open(SLOT_CONFIG, "w") as f:
-                                    json.dump(dict(_slots), f, indent=2)
-                                if firebase:
-                                    firebase.push_slot_layout(dict(_slots))
-                                log.info(f"[BG] Auto-created parked-car slot {new_id} at ({int(cx)},{int(cy)}) after {still}s still.")
+                            tmp_id = f"_tmp_{int(cx)}_{int(cy)}"
+                            _slots[tmp_id] = {
+                                "coords": [[x1p,y1p],[x2p,y1p],[x2p,y2p],[x1p,y2p]],
+                                "row":    _row_label_for_point(cx, cy, guides) if guides else _infer_row_from_y(cy, frame_h),
+                                "source": "parked",
+                            }
+                            _renumber_and_persist()
+                        log.info(f"[BG] Auto-created parked-car slot at ({int(cx)},{int(cy)}) after {still}s still.")
+                elif still >= RESERVE_OVERRIDE_FRAMES:
+                    hit = _find_overlapping_reserve_slot(vb["coords"])
+                    if hit:
+                        sid, _ = hit
+                        x1p, y1p, x2p, y2p = [int(c) for c in vb["coords"]]
+                        with _state_lock:
+                            _slots[sid]["coords"] = [[x1p,y1p],[x2p,y1p],[x2p,y2p],[x1p,y2p]]
+                            _slots[sid]["source"] = "parked"
+                            _renumber_and_persist()
+                        log.info(f"[BG] Reserve slot {sid} bbox rewritten to car at ({int(cx)},{int(cy)}) after {still} frames still.")
             _parked_watcher.clear()
             _parked_watcher.update(new_watcher)
+
+            # ── Moving-car watcher (class-0 cars in drive lanes, not near any row guide) ─
+            # Requires row guides to be set — disabled when _row_guides is empty.
+            if guides:
+                new_moving: dict = {}
+                mono_now = time.monotonic()
+                for vb in vehicle_boxes:
+                    if vb.get("cls_id", 0) != 0:
+                        continue
+                    cx = (vb["coords"][0] + vb["coords"][2]) / 2
+                    cy = (vb["coords"][1] + vb["coords"][3]) / 2
+                    if any(
+                        (
+                            _perp_dist_to_segment(cx, cy, gy["x1"], gy["y1"], gy["x2"], gy["y2"])[0] < RESERVE_GUIDE_TOL_PX
+                            and _point_within_guide_extent(cx, cy, gy)
+                        )
+                        if (isinstance(gy, dict) and "y1" in gy)
+                        else abs(cy - (gy.get("y", 0) if isinstance(gy, dict) else gy)) < RESERVE_GUIDE_TOL_PX
+                        for gy in guides
+                    ):
+                        continue  # near a parking row — handled by _parked_watcher
+                    matched_key = next(
+                        (k for k, v in _moving_watcher.items()
+                         if abs(cx - v["cx"]) < MOVING_CAR_MATCH_PX
+                         and abs(cy - v["cy"]) < MOVING_CAR_MATCH_PX),
+                        None,
+                    )
+                    first_seen = _moving_watcher[matched_key]["first_seen"] if matched_key else mono_now
+                    new_key = f"car_{int(cx // 20)}_{int(cy // 20)}"
+                    new_moving[new_key] = {
+                        "cx": int(cx), "cy": int(cy),
+                        "first_seen": first_seen, "last_seen": mono_now,
+                    }
+                _moving_watcher.clear()
+                _moving_watcher.update(new_moving)
+                active_movers = {
+                    k: {"cx": v["cx"], "cy": v["cy"]}
+                    for k, v in _moving_watcher.items()
+                    if (mono_now - v["first_seen"]) >= MOVING_CAR_COOLDOWN_SECS
+                }
+                if firebase:
+                    firebase.push_moving_cars(active_movers)
+            else:
+                if _moving_watcher:
+                    _moving_watcher.clear()
+                    if firebase:
+                        firebase.push_moving_cars({})
 
             # Write shared state — stream thread handles frame annotation + encoding
             with _state_lock:
@@ -1037,9 +1228,11 @@ def _detection_loop():
                 _latest_statuses      = dict(statuses)
                 _frame_count          = local_frame_count
 
-            # Firebase push every firebase_every cycles
+            # Firebase push every firebase_every cycles — skip manually overridden slots
             if firebase and local_frame_count % max(1, firebase_every) == 0:
-                firebase.push_occupancy(statuses)
+                with _state_lock:
+                    skip = set(_overridden_slots)
+                firebase.push_occupancy(statuses, skip_slots=skip)
 
             occupied     = sum(1 for s in statuses.values() if s == "Occupied")
             reserved     = sum(1 for s in statuses.values() if s == "Reserved")
@@ -1304,6 +1497,28 @@ def live_frame():
                     headers={"Cache-Control": "no-cache, no-store, must-revalidate"})
 
 
+@app.route("/debug-frame", methods=["GET"])
+def debug_frame():
+    """Full-resolution high-quality snapshot for inspecting YOLO detection boxes."""
+    with _state_lock:
+        raw      = _latest_raw_frame.copy() if _latest_raw_frame is not None else None
+        vboxes   = list(_latest_vehicle_boxes)
+        slot_res = list(_latest_slot_results)
+
+    if raw is None:
+        placeholder = np.zeros((720, 1280, 3), dtype=np.uint8)
+        cv2.putText(placeholder, "No frame yet", (200, 360),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (80, 80, 80), 2)
+        _, buf = cv2.imencode(".jpg", placeholder)
+        return Response(buf.tobytes(), mimetype="image/jpeg",
+                        headers={"Cache-Control": "no-cache"})
+
+    annotated = _draw_boxes(raw, vboxes, slot_res)
+    _, buf    = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, 92])
+    return Response(buf.tobytes(), mimetype="image/jpeg",
+                    headers={"Cache-Control": "no-cache, no-store, must-revalidate"})
+
+
 @app.route("/analyze-image", methods=["POST"])
 def analyze_image():
     """Upload an image for one-shot YOLO analysis (uses shared model)."""
@@ -1322,7 +1537,7 @@ def analyze_image():
         _cls_confs = {
             0: _prog_cfg.get("conf_cls0", 0.20),
             1: _prog_cfg.get("conf_cls1", 0.45),
-            2: _prog_cfg.get("conf_cls2", 0.45),
+            3: _prog_cfg.get("conf_cls3", 0.60),
         }
     with _yolo_lock:
         results = model(frame, conf=live_conf, classes=TARGET_CLASSES, verbose=False)
@@ -1355,8 +1570,8 @@ def analyze_image():
     if not current_slots:
         estimated = []
         for i, vb in enumerate(vehicle_boxes):
-            # class 1/2 (traffic cone / reserve stand) → Reserved
-            status = "Reserved" if vb["cls_id"] in (1, 2) else "Occupied"
+            # class 1/3 (traffic cone / reserve) → Reserved
+            status = "Reserved" if vb["cls_id"] in (1, 3) else "Occupied"
             estimated.append({
                 "id":         f"S{i+1:02d}",
                 "status":     status,
@@ -1386,7 +1601,7 @@ def analyze_image():
         )
         if matched_vb is None:
             status = "Vacant"
-        elif matched_vb["cls_id"] in (1, 2):
+        elif matched_vb["cls_id"] in (1, 3):
             status = "Reserved"
             reserved_count += 1
         else:
@@ -1398,7 +1613,7 @@ def analyze_image():
             "status":     status,
             "confidence": round(conf, 3),
             "row":        slot_data.get("row", "A"),
-            "coords":     slot_data["coords"],
+            "coords":     coords,
         })
 
     vacant_count = len(current_slots) - occupied_count - reserved_count
@@ -1434,7 +1649,7 @@ def set_program_config():
         "confidence":      max(0.05, min(0.95, float(data.get("confidence",      current["confidence"])))),
         "conf_cls0":       max(0.05, min(0.95, float(data.get("conf_cls0",       current.get("conf_cls0", 0.20))))),
         "conf_cls1":       max(0.05, min(0.95, float(data.get("conf_cls1",       current.get("conf_cls1", 0.45))))),
-        "conf_cls2":       max(0.05, min(0.95, float(data.get("conf_cls2",       current.get("conf_cls2", 0.45))))),
+        "conf_cls3":       max(0.05, min(0.95, float(data.get("conf_cls3",       current.get("conf_cls3", 0.60))))),
         "iou_threshold":   max(0.1,  min(0.9,  float(data.get("iou_threshold",   current["iou_threshold"])))),
         "smoothing_win":   max(1,    min(30,   int(data.get("smoothing_win",     current["smoothing_win"])))),
         "detect_interval": max(0.0,  min(5.0,  float(data.get("detect_interval", current["detect_interval"])))),
@@ -1708,7 +1923,19 @@ def trigger_remap():
         mode = "auto"
 
     raw_guides = data.get("row_guides", [])
-    guides = [int(y) for y in raw_guides if isinstance(y, (int, float))] if isinstance(raw_guides, list) else []
+    guides = []
+    if isinstance(raw_guides, list):
+        for g in raw_guides:
+            if isinstance(g, dict):
+                if "y1" in g:           # new angled format {x1,y1,x2,y2}
+                    guides.append({"x1": int(g["x1"]), "y1": int(g["y1"]),
+                                   "x2": int(g["x2"]), "y2": int(g["y2"])})
+                else:                   # previous {y, x1, x2} horizontal → convert
+                    y = int(g.get("y", 0))
+                    guides.append({"x1": int(g.get("x1", 0)), "y1": y,
+                                   "x2": int(g.get("x2", 9999)), "y2": y})
+            elif isinstance(g, (int, float)):   # legacy plain int Y value
+                guides.append({"x1": 0, "y1": int(g), "x2": 9999, "y2": int(g)})
 
     with _state_lock:
         _remap_requested   = True
@@ -1718,18 +1945,110 @@ def trigger_remap():
         _slots             = {}   # wipe in-memory slots so no stale push fires before BG thread resets
     _parked_watcher.clear()
     _reserve_watcher.clear()
+    if guides:
+        try:
+            with open(GUIDE_CONFIG, "w") as _gf:
+                json.dump(guides, _gf)
+        except Exception as _e:
+            log.warning(f"Could not save guides: {_e}")
+    elif os.path.exists(GUIDE_CONFIG):
+        os.remove(GUIDE_CONFIG)
     if os.path.exists(SLOT_CONFIG):
         os.remove(SLOT_CONFIG)
     # Clear Firebase immediately so the map goes blank during remapping
     if firebase_instance:
         firebase_instance.clear_slots_and_layout()
-    log.info(f"[ADMIN] Remap requested (mode={mode}, guides={guides}) — bg thread will reset mapper on next frame.")
+    log.info(f"[ADMIN] Remap requested (mode={mode}, {len(guides)} guides) — bg thread will reset mapper on next frame.")
     return jsonify({
         "status":      "remap_started",
         "layout_mode": mode,
         "row_guides":  guides,
         "message":     f"Auto-mapping restarted in '{mode}' mode with {len(guides)} row guide(s).",
     })
+
+
+@app.route("/remap/guides", methods=["GET"])
+def get_remap_guides():
+    """Return the current row guide configuration and tolerance band."""
+    with _state_lock:
+        guides = list(_row_guides)
+    return jsonify({"guides": guides, "tolerance_px": RESERVE_GUIDE_TOL_PX})
+
+
+@app.route("/remap/suggest-guides", methods=["GET"])
+def suggest_row_guides():
+    """
+    Suggest row guide lines.
+    Strategy:
+      1. Try gap-clustering by X and by Y (threshold 150 px).
+      2. Pick whichever axis produces more multi-car (≥2) groups.
+      3. For each group, fit a PCA line through that group's points.
+    Returns [{x1, y1, x2, y2, label}].
+    """
+    import numpy as np
+
+    with _state_lock:
+        boxes = list(_latest_vehicle_boxes)
+
+    car_boxes = [vb for vb in boxes if vb.get("cls_id", 0) == 0]
+    if not car_boxes:
+        return jsonify({"guides": [], "note": "No vehicles detected in current frame."})
+
+    centers = []
+    for vb in car_boxes:
+        c = vb["coords"]
+        centers.append(((c[0] + c[2]) / 2, (c[1] + c[3]) / 2))
+
+    if len(centers) < 2:
+        return jsonify({"guides": [], "note": "Need at least 2 vehicles to suggest guides."})
+
+    GAP = 150
+
+    def _gap_cluster(pts, axis):
+        s = sorted(pts, key=lambda p: p[axis])
+        clusters, cur = [], [s[0]]
+        for p in s[1:]:
+            if p[axis] - cur[-1][axis] > GAP:
+                clusters.append(cur); cur = []
+            cur.append(p)
+        clusters.append(cur)
+        return clusters
+
+    y_cls = _gap_cluster(centers, 1)
+    x_cls = _gap_cluster(centers, 0)
+
+    def _usable(cls): return sum(1 for c in cls if len(c) >= 2)
+    # Prefer the axis that produces more multi-car groups; tie goes to Y (horizontal rows)
+    clusters = y_cls if _usable(y_cls) >= _usable(x_cls) else x_cls
+    clusters = [c for c in clusters if len(c) >= 2][:6]
+
+    if not clusters:
+        return jsonify({"guides": [], "note": "Could not find multi-car rows in current frame."})
+
+    PADDING = 80
+
+    def _fit_line(pts):
+        xs = np.array([p[0] for p in pts], dtype=float)
+        ys = np.array([p[1] for p in pts], dtype=float)
+        cx, cy = xs.mean(), ys.mean()
+        stacked = np.column_stack([xs - cx, ys - cy])
+        _, _, vt = np.linalg.svd(stacked, full_matrices=False)
+        d = vt[0]
+        projs = stacked @ d
+        p_min, p_max = projs.min() - PADDING, projs.max() + PADDING
+        return (int(cx + p_min * d[0]), int(cy + p_min * d[1]),
+                int(cx + p_max * d[0]), int(cy + p_max * d[1]))
+
+    # Sort clusters by centroid Y (top→bottom = A, B, C…)
+    clusters.sort(key=lambda cl: sum(p[1] for p in cl) / len(cl))
+
+    guides = []
+    for idx, cl in enumerate(clusters):
+        x1, y1, x2, y2 = _fit_line(cl)
+        guides.append({"x1": x1, "y1": y1, "x2": x2, "y2": y2,
+                       "label": chr(ord("A") + idx)})
+
+    return jsonify({"guides": guides})
 
 
 # ── AI-Gen Slot Discovery endpoints ──────────────────────────────────────────
@@ -1796,7 +2115,7 @@ def ai_mapping_generate():
         try:
             cone_boxes = [
                 list(map(int, vb["coords"]))
-                for vb in cone_boxes_snap if vb.get("cls_id", 0) in (1, 2)
+                for vb in cone_boxes_snap if vb.get("cls_id", 0) in (1, 3)
             ]
             if nb_key:
                 # Nano Banana Pro — needs a public URL; upload frame to Firebase Storage first
@@ -1817,10 +2136,15 @@ def ai_mapping_generate():
             with _state_lock:
                 current_slot_ids = set(_slots.keys())
                 live_conf        = _prog_cfg["confidence"]
+                row_guides_snap  = list(_row_guides)
 
             with _yolo_lock:  # Fix #1: YOLO not thread-safe — guard shared model
-                proposed = extract_slots_from_ai_frame(generated, model, live_conf, current_slot_ids,
-                                                        cam_frame_bytes=frame_bytes)
+                proposed = extract_slots_from_ai_frame(
+                    generated, model, live_conf, current_slot_ids,
+                    cam_frame_bytes=frame_bytes,
+                    row_guides=row_guides_snap,
+                    row_tol=RESERVE_GUIDE_TOL_PX,
+                )
             log.info(f"[AI] Extraction complete — {len(proposed)} proposed slots")
 
             with _state_lock:
@@ -1862,19 +2186,23 @@ def ai_mapping_confirm():
     """
     Merge AI-proposed slots into the active slot set, persist to disk and Firebase.
     Clears the AI generation state and switches to live occupancy mode.
+    Optional body: {"exclude": ["S01", "S03"]} — slot IDs to drop before confirming.
     """
     global _slots, _mapping_phase, _ai_phase, _ai_proposed_slots, _ai_generated_image
+
+    data    = request.get_json(silent=True) or {}
+    exclude = set(data.get("exclude", []))
 
     with _state_lock:
         if not _ai_proposed_slots:
             return jsonify({"error": "No proposed slots to confirm."}), 400
-        merged = dict(_ai_proposed_slots)   # AI slots replace DBSCAN slots entirely
-        _slots              = merged
+        filtered            = {k: v for k, v in _ai_proposed_slots.items() if k not in exclude}
+        _slots              = renumber_slots_by_position(filtered)
         _mapping_phase      = False
         _ai_phase           = "idle"
-        proposed_copy       = dict(_ai_proposed_slots)
         _ai_proposed_slots  = {}
         _ai_generated_image = None
+        merged = dict(_slots)
 
     with open(SLOT_CONFIG, "w") as f:
         json.dump(merged, f, indent=2)
@@ -1882,8 +2210,9 @@ def ai_mapping_confirm():
         firebase_instance.push_slot_layout(merged)
         firebase_instance.reset_slots({sid: "Vacant" for sid in merged})
 
-    log.info(f"[AI] Confirmed {len(proposed_copy)} AI-generated slots — replaced DBSCAN slots.")
-    return jsonify({"saved": len(proposed_copy), "total": len(merged)})
+    saved = len(filtered)
+    log.info(f"[AI] Confirmed {saved} AI-generated slots (excluded {len(exclude)}) — replaced DBSCAN slots.")
+    return jsonify({"saved": saved, "total": len(merged)})
 
 
 @app.route("/ai-mapping/reject", methods=["POST"])
@@ -1903,7 +2232,7 @@ def add_slot():
     """
     Admin endpoint — add a brand-new slot with a given quad.
     Fix #7: previously there was no way to add a slot the automapper missed
-    without hand-editing slot_config.json on the Pi.
+    without hand-editing <PIN>_slot_config.json on the Pi.
     Body: { "slot_id": "S99", "coords": [[x,y],[x,y],[x,y],[x,y]], "row": "A" }
     """
     global _slots
@@ -1921,16 +2250,11 @@ def add_slot():
         if slot_id in _slots:
             return jsonify({"error": f"Slot {slot_id} already exists — use PUT to update"}), 409
         _slots[slot_id] = {"coords": coords, "row": row, "source": "manual"}
-        current = dict(_slots)
+        _renumber_and_persist()
+        assigned_id = next((k for k, v in _slots.items() if v.get("coords") == coords), slot_id)
 
-    with open(SLOT_CONFIG, "w") as f:
-        json.dump(current, f, indent=2)
-
-    if firebase_instance:
-        firebase_instance.push_slot_layout(current)
-
-    log.info(f"[ADMIN] Slot {slot_id} added manually at row={row}.")
-    return jsonify({"status": "ok", "slot_id": slot_id, "coords": coords, "row": row}), 201
+    log.info(f"[ADMIN] Slot {assigned_id} added manually at row={row}.")
+    return jsonify({"status": "ok", "slot_id": assigned_id, "coords": coords, "row": row}), 201
 
 
 @app.route("/slots/<slot_id>", methods=["PUT"])
@@ -2039,13 +2363,13 @@ def video_pause():
 
 @app.route("/video/stop", methods=["POST"])
 def video_stop():
-    """Stop video playback and reset to beginning."""
+    """Stop video playback and reset to beginning. Grabber falls back to RTSP."""
     global _vid_state, _vid_frame
     with _vid_lock:
         _vid_state = "stopped"
         _vid_frame = 0
-    log.info("[VID] Playback stopped.")
-    return jsonify({"status": "stopped"})
+    log.info("[VID] Playback stopped — grabber will revert to RTSP stream.")
+    return jsonify({"status": "stopped", "source": "rtsp"})
 
 
 @app.route("/video/unload", methods=["POST"])
@@ -2087,16 +2411,15 @@ def video_status():
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    print("\n=== Smart Parking Flask API (Raspberry Pi) ===")
+    print("\n=== Smart Parking Flask API (localhost) ===")
     print(f"Pi ID       : {LOCAL_PIN_CODE}")
     print(f"Live source : {RTSP_URL}")
     print(f"Video file  : POST /video/load  →  POST /video/start")
     print(f"Switch back : POST /video/stop  or  POST /video/unload")
-    print(f"API         : http://<PI_ZT_IP>:{FLASK_PORT}")
+    print(f"API         : http://localhost:{FLASK_PORT}")
     print("Routes: /status  /slots  /occupancy  /live-frame  /analyze-image  /remap")
     print("        /slots/<id> PUT/DELETE  /program-config  /undistort-config")
     print("        /video/load  /video/start  /video/pause  /video/stop  /video/unload  /video/status")
-    print("        /ai-mapping/best-frame  /ai-mapping/generate  /ai-mapping/confirm  /ai-mapping/reject")
     print("=========================================\n")
 
     if FIREBASE_ENABLED:
@@ -2119,7 +2442,22 @@ if __name__ == "__main__":
             storage_bucket=FIREBASE_STORAGE_BUCKET,
         )
 
+        # Store resolved pin so _deregister_pi knows which entry to remove
+        _current_active_pin = active_pin
+
         register_pi()
         threading.Thread(target=_heartbeat_loop, daemon=True).start()
 
-    app.run(host="0.0.0.0", port=FLASK_PORT, debug=False, threaded=True)
+        # Register shutdown handlers so the pin is removed from active_pins
+        # when this process exits cleanly (Ctrl+C, SIGTERM, service stop, etc.)
+        import atexit, signal as _signal, sys as _sys
+        atexit.register(_deregister_pi)
+        try:
+            _signal.signal(_signal.SIGTERM, lambda *_: _sys.exit(0))
+        except (OSError, ValueError):
+            pass  # SIGTERM not available on all platforms
+
+    try:
+        app.run(host="0.0.0.0", port=FLASK_PORT, debug=False, threaded=True)
+    finally:
+        _deregister_pi()  # covers KeyboardInterrupt / unexpected Flask exit

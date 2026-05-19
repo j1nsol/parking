@@ -67,6 +67,7 @@ class ParkingDetector:
             self.undistorter = None
             log.info("Fisheye undistortion disabled.")
 
+
         # Smoothing history: slot_id -> deque of recent statuses
         self._history: dict[str, deque] = {}
 
@@ -136,7 +137,7 @@ class ParkingDetector:
         self,
         vehicle_boxes: list[list[float]],
         slots: dict,
-        iou_threshold: float = 0.35,
+        iou_threshold: float = 0.50,
     ) -> dict[str, str]:
         """
         Compare detected vehicles against known parking slots.
@@ -163,7 +164,7 @@ class ParkingDetector:
             for vbox in vehicle_boxes:
                 vx1, vy1, vx2, vy2 = vbox
                 cx = (vx1 + vx2) / 2
-                cy = (vy1 + vy2) / 2
+                cy = vy1 + (vy2 - vy1) * 0.75  # bottom-biased: tires are at base of bbox
 
                 if self._is_quad(coords):
                     # Point-in-polygon test using vehicle centre

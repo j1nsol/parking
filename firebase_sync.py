@@ -59,15 +59,31 @@ class FirebaseSync:
     # ------------------------------------------------------------------
     # Push occupancy status
     # ------------------------------------------------------------------
-    def push_occupancy(self, statuses: dict):
-        """Write {slotId: status_string} to /locations/{pinCode}/slots."""
+    def get_overridden_slots(self) -> set:
+        """Return slot IDs where isOverridden is True — these must not be overwritten."""
+        try:
+            slots = db.reference(f"/{self._base}/slots").get() or {}
+            return {
+                sid for sid, data in slots.items()
+                if isinstance(data, dict) and data.get("isOverridden")
+            }
+        except Exception as e:
+            log.warning(f"[FB] Failed to read overridden slots: {e}")
+            return set()
+
+    def push_occupancy(self, statuses: dict, skip_slots: set = None):
+        """Write {slotId: status_string} to /locations/{pinCode}/slots, skipping manually overridden slots."""
+        skip = skip_slots or set()
         payload = {
             slot_id: {
                 "status":    status,
                 "updatedAt": int(time.time() * 1000),
             }
             for slot_id, status in statuses.items()
+            if slot_id not in skip
         }
+        if not payload:
+            return
         try:
             db.reference(f"/{self._base}/slots").update(payload)
         except Exception as e:
@@ -279,3 +295,37 @@ class FirebaseSync:
             log.info(f"[FB] Temp frame deleted: {blob_name}")
         except Exception as e:
             log.warning(f"[FB] Failed to delete temp frame '{blob_name}': {e}")
+
+    # ------------------------------------------------------------------
+    # Active-pins heartbeat — used by flask_api.py to signal liveness
+    # ------------------------------------------------------------------
+    def mark_pin_active(self, pin_code: str) -> None:
+        """Write a heartbeat timestamp to /pi_config/active_pins/{pin_code}."""
+        try:
+            db.reference(f"/pi_config/active_pins/{pin_code}").set(int(time.time() * 1000))
+        except Exception as e:
+            log.warning(f"[FB] Failed to mark pin active: {e}")
+
+    def mark_pin_inactive(self, pin_code: str) -> None:
+        """Remove /pi_config/active_pins/{pin_code} to signal the pin is offline."""
+        try:
+            db.reference(f"/pi_config/active_pins/{pin_code}").delete()
+        except Exception as e:
+            log.warning(f"[FB] Failed to mark pin inactive: {e}")
+
+    # ------------------------------------------------------------------
+    # Moving-car positions — transient drive-lane vehicles shown on driver UI
+    # ------------------------------------------------------------------
+    def push_moving_cars(self, moving_cars: dict) -> None:
+        """Replace /{base}/moving_cars with the current set of active drive-lane car positions."""
+        try:
+            db.reference(f"/{self._base}/moving_cars").set(moving_cars)
+        except Exception as e:
+            log.warning(f"[FB] Failed to push moving cars: {e}")
+
+    def clear_moving_cars(self) -> None:
+        """Wipe /{base}/moving_cars — called on clean shutdown."""
+        try:
+            db.reference(f"/{self._base}/moving_cars").set({})
+        except Exception as e:
+            log.warning(f"[FB] Failed to clear moving cars: {e}")

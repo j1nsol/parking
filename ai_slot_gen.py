@@ -213,16 +213,22 @@ def extract_slots_from_ai_frame(
     conf: float,
     existing_slot_ids: set,
     cam_frame_bytes: bytes | None = None,
+    row_guides: list | None = None,
+    row_tol: int = 80,
 ) -> dict:
     """
     Run YOLO on the AI-generated image and convert each detected car bbox to a slot quad.
 
     Returns a dict of proposed slots:
-      { "S01": {"coords": [[x,y],[x,y],[x,y],[x,y]], "source": "ai_generated"}, ... }
+      { "S01": {"coords": [[x,y],[x,y],[x,y],[x,y]], "row": "A", "source": "ai_generated"}, ... }
 
     Slot IDs are assigned sequentially, skipping IDs already in existing_slot_ids.
     If cam_frame_bytes is provided the AI image is resized to match the camera resolution
     before YOLO runs, so all output coordinates are already in camera space.
+
+    If row_guides are provided, slots whose Y center is more than row_tol pixels from
+    every guide are discarded (drive-lane detections). Remaining slots get a "row" label
+    assigned by nearest guide. Falls back to vertical-thirds heuristic when no guides set.
     """
     img = cv2.imdecode(np.frombuffer(ai_frame_bytes, np.uint8), cv2.IMREAD_COLOR)
     if img is None:
@@ -238,6 +244,42 @@ def extract_slots_from_ai_frame(
                 log.info(f"[AI] Resizing AI image {ai_w}×{ai_h} → {cam_w}×{cam_h} to match camera")
                 img = cv2.resize(img, (cam_w, cam_h), interpolation=cv2.INTER_AREA)
 
+    frame_h = img.shape[0]
+
+    import math as _math
+
+    def _perp_dist_seg(px, py, x1, y1, x2, y2):
+        dx, dy = x2 - x1, y2 - y1
+        lsq = dx*dx + dy*dy
+        if lsq == 0:
+            return _math.hypot(px - x1, py - y1), 0.5
+        t = max(0.0, min(1.0, ((px - x1)*dx + (py - y1)*dy) / lsq))
+        return _math.hypot(px - (x1 + t*dx), py - (y1 + t*dy)), t
+
+    def _guide_mid_y(g):
+        if isinstance(g, dict):
+            return (g["y1"] + g["y2"]) / 2 if "y1" in g else g.get("y", 0)
+        return float(g)
+
+    sorted_guides = sorted(row_guides, key=_guide_mid_y) if row_guides else []
+
+    def _row_for_point(cx, cy):
+        if sorted_guides:
+            best_idx, best_dist, best_t = 0, float("inf"), 0.5
+            for i, g in enumerate(sorted_guides):
+                if isinstance(g, dict) and "y1" in g:
+                    d, t = _perp_dist_seg(cx, cy, g["x1"], g["y1"], g["x2"], g["y2"])
+                else:
+                    gy = g.get("y", 0) if isinstance(g, dict) else float(g)
+                    d, t = abs(cy - gy), 0.5
+                if d < best_dist:
+                    best_dist, best_idx, best_t = d, i, t
+            if best_dist > row_tol or not (0.0 <= best_t <= 1.0):
+                return None  # outside guide — drive lane or beyond row extent
+            return chr(ord("A") + best_idx)
+        r = cy / max(frame_h, 1)
+        return "A" if r < 0.33 else ("B" if r < 0.66 else "C")
+
     results = yolo_model(img, conf=conf, classes=TARGET_CLASSES, verbose=False)
     boxes = []
     for r in results:
@@ -250,7 +292,14 @@ def extract_slots_from_ai_frame(
 
     slots = {}
     counter = 1
+    skipped = 0
     for x1, y1, x2, y2 in boxes:
+        cx_center = (x1 + x2) / 2
+        y_center  = (y1 + y2) / 2
+        row = _row_for_point(cx_center, y_center)
+        if row is None:
+            skipped += 1
+            continue
         while True:
             candidate = f"S{counter:02d}"
             if candidate not in existing_slot_ids and candidate not in slots:
@@ -258,8 +307,11 @@ def extract_slots_from_ai_frame(
             counter += 1
         slots[candidate] = {
             "coords": [[x1, y1], [x2, y1], [x2, y2], [x1, y2]],
+            "row":    row,
             "source": "ai_generated",
         }
         counter += 1
 
+    if skipped:
+        log.info(f"[AI] Skipped {skipped} drive-lane detection(s) outside row guide bands")
     return slots
