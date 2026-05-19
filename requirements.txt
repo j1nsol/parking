@@ -9,3 +9,4 @@ numpy>=1.24.0
 requests>=2.31.0          # HTTP calls for Nano Banana Pro API
 Pillow>=10.0.0            # PIL.Image used in ai_slot_gen.py
 google-generativeai>=0.8.0  # Gemini fallback provider
+python-dotenv>=1.0.0      # loads .env file for API keys
