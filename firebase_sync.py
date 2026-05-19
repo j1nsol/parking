@@ -2,6 +2,7 @@
 firebase_sync.py — Pushes occupancy data to Firebase Realtime Database.
 """
 
+import datetime
 import time
 import logging
 import firebase_admin
@@ -268,10 +269,13 @@ class FirebaseSync:
     # ------------------------------------------------------------------
     def upload_temp_frame(self, jpeg_bytes: bytes) -> tuple[str, str]:
         """
-        Upload a JPEG frame to Firebase Storage as a public temp file.
+        Upload a JPEG frame to Firebase Storage and return a signed URL valid for 15 minutes.
 
-        Returns (public_url, blob_name) so the caller can delete it after use.
+        Returns (signed_url, blob_name) so the caller can delete it after use.
         Raises RuntimeError if storage_bucket was not configured.
+
+        Uses a signed URL instead of make_public() so this works with buckets
+        that have uniform bucket-level access enabled (the Firebase default since ~2022).
         """
         if not self._storage_bucket:
             raise RuntimeError(
@@ -281,8 +285,11 @@ class FirebaseSync:
         bucket = storage.bucket(self._storage_bucket)
         blob   = bucket.blob(blob_name)
         blob.upload_from_string(jpeg_bytes, content_type="image/jpeg")
-        blob.make_public()
-        url = blob.public_url
+        url = blob.generate_signed_url(
+            expiration=datetime.timedelta(minutes=15),
+            method="GET",
+            version="v4",
+        )
         log.info(f"[FB] Temp frame uploaded → {url}")
         return url, blob_name
 
