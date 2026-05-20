@@ -120,6 +120,7 @@ _state_lock       = threading.RLock()
 _latest_frame     = None          # Last annotated JPEG bytes (kept for /live-frame fallback)
 _latest_raw_frame = None          # Last raw numpy frame (for undistort preview)
 _latest_statuses  = {}            # slot_id -> "Occupied" | "Vacant"
+_prev_statuses    = {}            # snapshot from last Firebase push — used for event-log diffing
 _latest_vehicle_boxes = []        # last YOLO detections — read by stream thread
 _latest_slot_results  = []        # last slot occupancy results — read by stream thread
 _slots            = {}            # slot_id -> {coords, row, ...}
@@ -810,7 +811,7 @@ def _detection_loop():
     Owns: camera, YOLO inference, auto-mapper, Firebase sync, smoothing.
     Writes results into shared state for Flask routes to read.
     """
-    global _latest_frame, _latest_raw_frame, _latest_statuses, _latest_vehicle_boxes, _latest_slot_results, _slots, _mapping_phase, _frame_count, _last_fb_push, firebase_instance, _remap_requested, _remap_layout_mode, mapper, _overridden_slots, _moving_watcher
+    global _latest_frame, _latest_raw_frame, _latest_statuses, _prev_statuses, _latest_vehicle_boxes, _latest_slot_results, _slots, _mapping_phase, _frame_count, _last_fb_push, firebase_instance, _remap_requested, _remap_layout_mode, mapper, _overridden_slots, _moving_watcher
 
     # ── Firebase ──────────────────────────────────────────────────────────────
     firebase = None
@@ -1014,9 +1015,12 @@ def _detection_loop():
                 frame = undistorter.process(frame)
 
             # ── Run YOLO (or reuse last result if skipping this frame) ─────────
+            _last_inference_ms = 0
             if local_frame_count % max(1, yolo_every_n) == 0:
+                _t_yolo = time.perf_counter()
                 with _yolo_lock:   # Fix #1: prevent race with /analyze-image
                     results = model(frame, conf=conf, classes=TARGET_CLASSES, verbose=False)
+                _last_inference_ms = round((time.perf_counter() - _t_yolo) * 1000)
                 vehicle_boxes = []
                 for r in results:
                     for box in r.boxes:
@@ -1264,6 +1268,28 @@ def _detection_loop():
                     skip = set(_overridden_slots)
                 firebase.push_occupancy(statuses, skip_slots=skip)
 
+                # Log occupancy-change events for analytics / diagnostics
+                _now_ms = int(time.time() * 1000)
+                _events = []
+                for _sid, _new in statuses.items():
+                    _old = _prev_statuses.get(_sid)
+                    if _old is not None and _old != _new:
+                        _conf = next(
+                            (vb["confidence"] for vb in vehicle_boxes if vb.get("label")),
+                            None,
+                        )
+                        _events.append({
+                            "timestamp_ms": _now_ms,
+                            "slot_id":      _sid,
+                            "old_state":    _old,
+                            "new_state":    _new,
+                            "confidence":   _conf,
+                            "inference_ms": _last_inference_ms,
+                        })
+                if _events:
+                    firebase.push_event_log(_events)
+                _prev_statuses = dict(statuses)
+
             occupied     = sum(1 for s in statuses.values() if s == "Occupied")
             reserved     = sum(1 for s in statuses.values() if s == "Reserved")
             car_count    = sum(1 for vb in vehicle_boxes if vb.get("cls_id", 0) == 0)
@@ -1457,6 +1483,16 @@ def get_occupancy():
         "total":    len(statuses),
         "timestamp": int(time.time() * 1000),
     })
+
+
+@app.route("/logs", methods=["GET"])
+def get_logs():
+    """Return recent occupancy-change event log from Firebase (newest first)."""
+    limit = min(int(request.args.get("limit", 200)), 1000)
+    if not firebase_instance:
+        return jsonify({"error": "Firebase not enabled"}), 503
+    events = firebase_instance.get_recent_logs(limit=limit)
+    return jsonify({"events": events, "count": len(events)})
 
 
 @app.route("/stream")

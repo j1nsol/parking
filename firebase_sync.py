@@ -304,6 +304,39 @@ class FirebaseSync:
             log.warning(f"[FB] Failed to delete temp frame '{blob_name}': {e}")
 
     # ------------------------------------------------------------------
+    # Event log — occupancy state transitions for analytics / diagnostics
+    # ------------------------------------------------------------------
+    def push_event_log(self, events: list) -> None:
+        """
+        Append occupancy-change events to /logs/{pin_code}/ in Firebase.
+        Each event: {timestamp_ms, slot_id, old_state, new_state, confidence, inference_ms}
+        Silently drops the write on any Firebase error to avoid disrupting the detection loop.
+        """
+        if not events:
+            return
+        try:
+            ref = db.reference(f"/logs/{self._base.split('/')[-1]}")
+            for ev in events:
+                ref.push(ev)
+        except Exception as e:
+            log.warning(f"[FB] Event log push failed: {e}")
+
+    def get_recent_logs(self, limit: int = 500) -> list:
+        """
+        Return the most recent `limit` log events as a list of dicts, newest first.
+        Returns [] on error.
+        """
+        try:
+            ref  = db.reference(f"/logs/{self._base.split('/')[-1]}")
+            data = ref.order_by_child("timestamp_ms").limit_to_last(limit).get()
+            if not data:
+                return []
+            return sorted(data.values(), key=lambda e: e.get("timestamp_ms", 0), reverse=True)
+        except Exception as e:
+            log.warning(f"[FB] Failed to read logs: {e}")
+            return []
+
+    # ------------------------------------------------------------------
     # Active-pins heartbeat — used by flask_api.py to signal liveness
     # ------------------------------------------------------------------
     def mark_pin_active(self, pin_code: str) -> None:
